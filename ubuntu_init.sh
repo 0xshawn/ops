@@ -1,16 +1,82 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-# Must run as root
-if [ "$EUID" -ne 0 ]
-  then echo "Please run as root"
-  exit
-fi
+# Usage:
+#   sudo ./ubuntu_init.sh
+#   wget -qO- <url-to-this-script> | sudo bash
 
-# 2. Must be Ubuntu
-if ! grep -qi "ubuntu" /etc/os-release; then
-  echo "Error: This script is only supported on Ubuntu >= 24.04."
+unsupported_os() {
+  echo "Error: This script is only supported on Ubuntu >= 24.04." >&2
+  exit 1
+}
+
+read_os_release_value() {
+  local key="$1"
+  local file="$2"
+  local line
+  local value
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key="*)
+        value="${line#*=}"
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+        printf '%s' "$value"
+        return 0
+        ;;
+    esac
+  done <"$file"
+
+  return 1
+}
+
+ensure_supported_os() {
+  local os_release_file="${OS_RELEASE_FILE:-/etc/os-release}"
+  local os_id
+  local version_id
+  local version_major
+  local version_minor
+
+  [ -r "$os_release_file" ] || unsupported_os
+
+  os_id="$(read_os_release_value ID "$os_release_file" || true)"
+  version_id="$(read_os_release_value VERSION_ID "$os_release_file" || true)"
+
+  [ "$os_id" = "ubuntu" ] || unsupported_os
+
+  version_major="${version_id%%.*}"
+  version_minor="${version_id#*.}"
+  if [ "$version_minor" = "$version_id" ]; then
+    version_minor="0"
+  else
+    version_minor="${version_minor%%.*}"
+  fi
+
+  case "$version_major" in
+    ''|*[!0-9]*) unsupported_os ;;
+  esac
+  case "$version_minor" in
+    ''|*[!0-9]*) unsupported_os ;;
+  esac
+
+  version_major=$((10#$version_major))
+  version_minor=$((10#$version_minor))
+
+  if [ "$version_major" -lt 24 ] ||
+    { [ "$version_major" -eq 24 ] && [ "$version_minor" -lt 4 ]; }; then
+    unsupported_os
+  fi
+}
+
+ensure_supported_os
+
+# Must run as root.
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo "Please run as root" >&2
   exit 1
 fi
 
@@ -19,9 +85,26 @@ update-alternatives --set editor /usr/bin/vim.basic
 
 # Install common tools
 apt update && \
-apt install -y git vim curl htop atop iotop tmux mtr \
+apt install -y git vim curl wget htop atop iotop tmux mtr \
     unzip zip zsh tree mosh \
     jq build-essential
+
+# Change Docker root
+mkdir -p /etc/docker /data/docker
+cat >/etc/docker/daemon.json <<EOL
+{
+  "data-root": "/data/docker",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file":"5"
+  }
+}
+EOL
+
+# Install Docker
+wget -qO- get.docker.com | bash
+systemctl enable docker
 
 # vim
 cat >/etc/vim/vimrc.local <<EOL
