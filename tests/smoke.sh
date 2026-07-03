@@ -61,37 +61,6 @@ has_single_top_level_script() {
   [ "$scripts" = "ubuntu_init.sh" ]
 }
 
-run_non_root_check() {
-  local mode="$1"
-  local script="$2"
-  local output
-  local status
-
-  set +e
-  if [ "$mode" = "direct" ]; then
-    output="$(OS_RELEASE_FILE="$UBUNTU_24_04_OS_RELEASE" "$ROOT_DIR/$script" 2>&1)"
-  elif [ "$mode" = "bash" ]; then
-    output="$(OS_RELEASE_FILE="$UBUNTU_24_04_OS_RELEASE" bash "$ROOT_DIR/$script" 2>&1)"
-  else
-    output="$(OS_RELEASE_FILE="$UBUNTU_24_04_OS_RELEASE" bash <"$ROOT_DIR/$script" 2>&1)"
-  fi
-  status=$?
-
-  [ "$status" -eq 1 ] && grep -q "Please run as root" <<<"$output"
-}
-
-supported_os_reaches_root_check() {
-  local os_release_file="$1"
-  local output
-  local status
-
-  set +e
-  output="$(OS_RELEASE_FILE="$os_release_file" bash "$ROOT_DIR/ubuntu_init.sh" 2>&1)"
-  status=$?
-
-  [ "$status" -eq 1 ] && grep -q "Please run as root" <<<"$output"
-}
-
 unsupported_os_fails_before_root_check() {
   local os_release_file="$1"
   local output
@@ -104,6 +73,51 @@ unsupported_os_fails_before_root_check() {
   [ "$status" -eq 1 ] &&
     grep -q "Error: This script is only supported on Ubuntu >= 24.04." <<<"$output" &&
     ! grep -q "Please run as root" <<<"$output"
+}
+
+supports_normal_user_entrypoint() {
+  grep -q '^require_sudo() {' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q '^run_as_root() {' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q '"$SUDO_BIN" -n true' "$ROOT_DIR/ubuntu_init.sh" &&
+    ! grep -q '^require_root() {' "$ROOT_DIR/ubuntu_init.sh" &&
+    ! grep -q 'Please run as root' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+system_changes_use_sudo_helper() {
+  grep -q 'run_as_root apt update' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'run_as_root apt install' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'run_as_root update-alternatives' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'run_as_root systemctl enable docker' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'run_as_root systemctl mask' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'write_root_file "/etc/docker/daemon.json"' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'write_root_file "/etc/sudoers.d/sudo" "0440"' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+docker_install_is_idempotent() {
+  awk '
+    /^install_docker\(\) \{/ { in_func = 1 }
+    in_func && /command -v docker/ { saw_docker_check = 1 }
+    in_func && /Docker is already installed/ { saw_skip_message = 1 }
+    in_func && /get\.docker\.com/ { saw_installer = 1 }
+    in_func && /systemctl enable docker/ { saw_enable = 1 }
+    in_func && /systemctl restart docker/ { saw_restart = 1 }
+    in_func && /^}/ { in_func = 0 }
+    END {
+      exit !(saw_docker_check && saw_skip_message && saw_installer && saw_enable && saw_restart)
+    }
+  ' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+user_config_targets_invoking_user() {
+  grep -q '^init_target_user() {' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'TARGET_HOME' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'TARGET_USER' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q '"$TARGET_HOME/.hushlogin"' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+readme_uses_normal_user_remote_command() {
+  grep -q 'curl -fsSL https://raw.githubusercontent.com/0xshawn/life-is-short/main/ubuntu_init.sh | bash' "$ROOT_DIR/README.md" &&
+    ! grep -q 'sudo bash' "$ROOT_DIR/README.md"
 }
 
 has_main_entrypoint() {
@@ -122,21 +136,39 @@ main_installs_tools_before_setting_editor() {
   ' "$ROOT_DIR/ubuntu_init.sh"
 }
 
+has_step_logging() {
+  grep -q '^log_step() {' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -q 'log_step "Done."' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+disable_welcome_message_uses_target_user() {
+  awk '
+    /^disable_welcome_message\(\) \{/ { in_func = 1 }
+    in_func && /TARGET_HOME/ { saw_target_home = 1 }
+    in_func && /TARGET_USER/ { saw_target_user = 1 }
+    in_func && /TARGET_GROUP/ { saw_target_group = 1 }
+    in_func && /^}/ { in_func = 0 }
+    END { exit !(saw_target_home && saw_target_user && saw_target_group) }
+  ' "$ROOT_DIR/ubuntu_init.sh"
+}
+
 for script in "${SCRIPTS[@]}"; do
   check "$script is executable" test -x "$ROOT_DIR/$script"
   check "$script has valid bash syntax" bash -n "$ROOT_DIR/$script"
-  check "$script fails clearly when run directly without root" run_non_root_check direct "$script"
-  check "$script fails clearly when run with bash without root" run_non_root_check bash "$script"
-  check "$script fails clearly when piped into bash without root" run_non_root_check pipe "$script"
 done
 
 check "repository has one top-level script" has_single_top_level_script
 check "Ubuntu 22.04 is rejected before root check" unsupported_os_fails_before_root_check "$UBUNTU_22_04_OS_RELEASE"
 check "Debian 12 is rejected before root check" unsupported_os_fails_before_root_check "$DEBIAN_12_OS_RELEASE"
-check "Ubuntu 24.04 reaches root check" supported_os_reaches_root_check "$UBUNTU_24_04_OS_RELEASE"
-check "Ubuntu 24.10 reaches root check" supported_os_reaches_root_check "$UBUNTU_24_10_OS_RELEASE"
+check "script supports normal user entrypoint" supports_normal_user_entrypoint
+check "system changes use sudo helper" system_changes_use_sudo_helper
+check "Docker install is idempotent" docker_install_is_idempotent
+check "user config targets invoking user" user_config_targets_invoking_user
+check "README uses normal user remote command" readme_uses_normal_user_remote_command
 check "ubuntu_init.sh has main entrypoint" has_main_entrypoint
 check "main installs tools before setting editor" main_installs_tools_before_setting_editor
+check "ubuntu_init.sh logs progress" has_step_logging
+check "welcome message disable uses target user" disable_welcome_message_uses_target_user
 
 if [ "$failures" -ne 0 ]; then
   exit 1
