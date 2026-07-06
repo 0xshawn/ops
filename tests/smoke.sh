@@ -191,6 +191,19 @@ zsh_initialization_installs_ohmyzsh_and_fzf() {
   ' "$ROOT_DIR/ubuntu_init.sh"
 }
 
+target_user_commands_use_target_login_shell() {
+  awk '
+    /^run_as_target_user\(\) \{/ { in_func = 1 }
+    in_func && /local target_shell/ { saw_local = 1 }
+    in_func && /getent passwd "\$TARGET_USER" \| cut -d: -f7/ { saw_getent = 1 }
+    in_func && /SHELL="\$target_shell"/ { saw_shell_env = 1 }
+    in_func && /^}/ { in_func = 0 }
+    END {
+      exit !(saw_local && saw_getent && saw_shell_env)
+    }
+  ' "$ROOT_DIR/ubuntu_init.sh"
+}
+
 readme_lists_node_module() {
   grep -q '| `install_node` | Install nvm and the latest Node.js LTS release |' "$ROOT_DIR/README.md"
 }
@@ -234,6 +247,7 @@ check "main installs Node after common tools" main_installs_node_after_common_to
 check "main initializes zsh after common tools" main_initializes_zsh_after_common_tools
 check "Node install uses nvm latest LTS" node_install_uses_nvm_lts
 check "zsh initialization installs oh-my-zsh and fzf" zsh_initialization_installs_ohmyzsh_and_fzf
+check "target user commands use target login shell" target_user_commands_use_target_login_shell
 check "README lists Node module" readme_lists_node_module
 check "README lists zsh module" readme_lists_zsh_module
 check "ubuntu_init.sh logs progress" has_step_logging

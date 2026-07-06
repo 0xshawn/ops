@@ -67,19 +67,24 @@ run_as_root() {
 }
 
 run_as_target_user() {
+  local target_shell
+
+  target_shell="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
+  [ -n "$target_shell" ] || target_shell="${SHELL:-/bin/sh}"
+
   if [ "$TARGET_USER" = "$(id -un)" ]; then
-    HOME="$TARGET_HOME" "$@"
+    HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
     return
   fi
 
   if is_root; then
     command -v runuser >/dev/null 2>&1 ||
       die "This script requires runuser to switch to $TARGET_USER."
-    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" "$@"
+    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
     return
   fi
 
-  "$SUDO_BIN" -H -u "$TARGET_USER" env HOME="$TARGET_HOME" "$@"
+  "$SUDO_BIN" -H -u "$TARGET_USER" env HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
 }
 
 write_root_file() {
