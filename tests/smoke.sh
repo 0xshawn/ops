@@ -248,6 +248,7 @@ check "Debian 12 is rejected before root check" unsupported_os_fails_before_root
 check "script supports normal user entrypoint" supports_normal_user_entrypoint
 check "system changes use sudo helper" system_changes_use_sudo_helper
 check "Docker install is idempotent" docker_install_is_idempotent
+check "Docker installer behavior" python3 "$ROOT_DIR/tests/docker_install_test.py"
 check "user config targets invoking user" user_config_targets_invoking_user
 check "README uses normal user remote command" readme_uses_normal_user_remote_command
 check "ubuntu_init.sh has main entrypoint" has_main_entrypoint
