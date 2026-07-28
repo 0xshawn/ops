@@ -415,7 +415,7 @@ select_modules_interactively() {
     selected[index]=1
   done
 
-  menu_line_count=$((${#MODULE_ORDER[@]} + 3))
+  menu_line_count=$((${#MODULE_ORDER[@]} + 5))
   printf '\033[?25l' >&3
 
   while true; do
@@ -425,6 +425,13 @@ select_modules_interactively() {
 
     printf '\033[2K\rSelect modules to install\n' >&3
     printf '\033[2K\rUse Up/Down to move, Space to toggle, Enter to confirm.\n' >&3
+
+    if [ "$current" -eq -1 ]; then
+      printf '\033[2K\r\033[7m> [ Clear all selections ]\033[0m\n' >&3
+    else
+      printf '\033[2K\r  [ Clear all selections ]\n' >&3
+    fi
+    printf '\033[2K\r----------------------------------------\n' >&3
 
     for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
       module="${MODULE_ORDER[$index]}"
@@ -456,18 +463,44 @@ select_modules_interactively() {
         escape_sequence=""
         IFS= read -rsn2 -t 0.1 escape_sequence <&3 || true
         case "$escape_sequence" in
-          '[A') current=$(((current + ${#MODULE_ORDER[@]} - 1) % ${#MODULE_ORDER[@]})) ;;
-          '[B') current=$(((current + 1) % ${#MODULE_ORDER[@]})) ;;
+          '[A')
+            if [ "$current" -eq -1 ]; then
+              current=$((${#MODULE_ORDER[@]} - 1))
+            elif [ "$current" -eq 0 ]; then
+              current=-1
+            else
+              current=$((current - 1))
+            fi
+            ;;
+          '[B')
+            if [ "$current" -eq -1 ]; then
+              current=0
+            elif [ "$current" -eq $((${#MODULE_ORDER[@]} - 1)) ]; then
+              current=-1
+            else
+              current=$((current + 1))
+            fi
+            ;;
         esac
         ;;
-      ' ')
-        if [ "${selected[$current]}" -eq 1 ]; then
-          selected[current]=0
-        else
-          selected[current]=1
+      ' '| '')
+        if [ "$current" -eq -1 ]; then
+          for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
+            selected[index]=0
+          done
+          current=0
+          continue
         fi
-        ;;
-      '')
+
+        if [ "$key" = ' ' ]; then
+          if [ "${selected[$current]}" -eq 1 ]; then
+            selected[current]=0
+          else
+            selected[current]=1
+          fi
+          continue
+        fi
+
         selected_count=0
         INTERACTIVE_SELECTED_MODULES=""
         for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do

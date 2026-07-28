@@ -151,6 +151,16 @@ class InteractiveMenuTest(unittest.TestCase):
         _, selected = self.run_menu(b"\x1b[B \x1b[A \r")
         self.assertEqual(selected, MODULES[2:])
 
+    def test_space_on_clear_action_clears_all_and_focuses_first_module(self) -> None:
+        output, selected = self.run_menu(b"\x1b[A  \r")
+        self.assertIn("[ Clear all selections ]", output)
+        self.assertNotIn("[x] Clear all selections", output)
+        self.assertEqual(selected, ["install_common_tools"])
+
+    def test_enter_on_clear_action_clears_all(self) -> None:
+        _, selected = self.run_menu(b"\x1b[A\r\x1b[B \r")
+        self.assertEqual(selected, ["initialize_zsh"])
+
     def test_empty_selection_is_rejected(self) -> None:
         keys = b" " + (b"\x1b[B " * (len(MODULES) - 1)) + b"\r \r"
         output, selected = self.run_menu(keys)

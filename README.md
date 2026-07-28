@@ -21,7 +21,9 @@ No arguments in an interactive terminal open the module selection menu:
 ```
 
 Every module is selected initially. Use Up and Down to move, Space to toggle a
-module, and Enter to confirm. At least one module must remain selected.
+module, and Enter to confirm. The distinct `Clear all selections` action above
+the module list clears every checkbox before you select the modules you want.
+At least one module must remain selected.
 
 The menu reads from the controlling terminal, so it also works with the remote
 execution command above. If no controlling terminal is available, an
