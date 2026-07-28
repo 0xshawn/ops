@@ -67,7 +67,7 @@ unsupported_os_fails_before_root_check() {
   local status
 
   set +e
-  output="$(OS_RELEASE_FILE="$os_release_file" bash "$ROOT_DIR/ubuntu_init.sh" 2>&1)"
+  output="$(OS_RELEASE_FILE="$os_release_file" bash "$ROOT_DIR/ubuntu_init.sh" all 2>&1)"
   status=$?
 
   [ "$status" -eq 1 ] &&
