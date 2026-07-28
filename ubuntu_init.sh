@@ -446,8 +446,8 @@ select_modules_interactively() {
     key=""
 
     if ! IFS= read -rsn1 key <&3; then
-      trap - EXIT INT TERM HUP
       cleanup_interactive_menu
+      trap - EXIT INT TERM HUP
       return 1
     fi
 
@@ -487,8 +487,8 @@ select_modules_interactively() {
           continue
         fi
 
-        trap - EXIT INT TERM HUP
         cleanup_interactive_menu
+        trap - EXIT INT TERM HUP
         return 0
         ;;
     esac
@@ -564,10 +564,9 @@ main() {
   done
 
   if [ "$original_arg_count" -eq 0 ] && has_controlling_terminal; then
-    if select_modules_interactively; then
-      selected_modules="$INTERACTIVE_SELECTED_MODULES"
-      run_all=0
-    fi
+    select_modules_interactively || die "Unable to read the interactive selection."
+    selected_modules="$INTERACTIVE_SELECTED_MODULES"
+    run_all=0
   fi
 
   log_step "Checking operating system"

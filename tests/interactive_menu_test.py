@@ -100,10 +100,17 @@ def create_menu_driver(directory: Path) -> Path:
     return driver
 
 
-def create_main_driver(directory: Path) -> Path:
+def create_main_driver(directory: Path, force_menu_failure: bool = False) -> Path:
     driver = directory / "main_driver.sh"
+    menu_overrides = ""
+    if force_menu_failure:
+        menu_overrides = """
+has_controlling_terminal() { return 0; }
+select_modules_interactively() { return 1; }
+"""
     driver.write_text(
         script_definitions()
+        + menu_overrides
         + """
 require_supported_os() { :; }
 init_target_user() { :; }
@@ -159,6 +166,7 @@ class InteractiveMenuTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                start_new_session=True,
             )
             selected = subprocess.run(
                 [
@@ -171,6 +179,7 @@ class InteractiveMenuTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                start_new_session=True,
             )
 
         self.assertEqual(
@@ -187,6 +196,23 @@ class InteractiveMenuTest(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertIn("Usage: ubuntu_init.sh", output)
         self.assertNotIn("Use Up/Down", output)
+
+    def test_menu_read_failure_aborts_instead_of_running_all_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            driver = create_main_driver(
+                Path(temporary_directory),
+                force_menu_failure=True,
+            )
+            result = subprocess.run(
+                ["/bin/bash", str(driver)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                start_new_session=True,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("RUN:", result.stdout)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
