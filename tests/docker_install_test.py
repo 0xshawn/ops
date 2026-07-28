@@ -22,6 +22,7 @@ def script_definitions() -> str:
 def run_install_docker(
     installer_exit: int = 0,
     docker_available_after_installer: bool = False,
+    docker_available_initially: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     with tempfile.TemporaryDirectory() as temporary_directory:
         directory = Path(temporary_directory)
@@ -38,6 +39,7 @@ TRACE_FILE={trace_path}
 DOCKER_CHECK_FILE={check_path}
 INSTALLER_EXIT={installer_exit}
 DOCKER_AVAILABLE_AFTER_INSTALLER={int(docker_available_after_installer)}
+DOCKER_AVAILABLE_INITIALLY={int(docker_available_initially)}
 
 is_root() {{ return 0; }}
 
@@ -46,6 +48,9 @@ command() {{
     checks="$(cat "$DOCKER_CHECK_FILE")"
     checks=$((checks + 1))
     printf '%s\n' "$checks" >"$DOCKER_CHECK_FILE"
+    if [ "$DOCKER_AVAILABLE_INITIALLY" -eq 1 ]; then
+      return 0
+    fi
     if [ "$DOCKER_AVAILABLE_AFTER_INSTALLER" -eq 1 ] && [ "$checks" -ge 2 ]; then
       return 0
     fi
@@ -111,6 +116,14 @@ class DockerInstallTest(unittest.TestCase):
                 "systemctl enable docker",
                 "systemctl restart docker",
             ],
+        )
+
+    def test_existing_docker_skips_installer_and_restarts_service(self) -> None:
+        result, trace = run_install_docker(docker_available_initially=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            trace,
+            ["systemctl enable docker", "systemctl restart docker"],
         )
 
 
