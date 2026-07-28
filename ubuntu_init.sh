@@ -3,8 +3,9 @@
 set -euo pipefail
 
 # Usage:
-#   sudo ./ubuntu_init.sh                       # run every module
-#   ./ubuntu_init.sh                            # run every module
+#   sudo ./ubuntu_init.sh                       # choose modules interactively
+#   ./ubuntu_init.sh                            # choose modules interactively
+#   ./ubuntu_init.sh all                        # run every module
 #   ./ubuntu_init.sh disable_welcome_message    # run only selected modules
 #   ./ubuntu_init.sh --list                     # list available modules
 #   curl -fsSL <url-to-this-script> | bash
@@ -19,6 +20,8 @@ readonly SUDO_BIN="${SUDO_BIN:-sudo}"
 TARGET_USER=""
 TARGET_HOME=""
 TARGET_GROUP=""
+INTERACTIVE_SELECTED_MODULES=""
+INTERACTIVE_MENU_TTY_OPEN=0
 
 die() {
   echo "$1" >&2
@@ -378,16 +381,135 @@ list_modules() {
   done
 }
 
+has_controlling_terminal() {
+  (exec 3<>/dev/tty) 2>/dev/null
+}
+
+cleanup_interactive_menu() {
+  if [ "$INTERACTIVE_MENU_TTY_OPEN" -eq 1 ]; then
+    printf '\033[?25h' >&3 2>/dev/null || true
+    exec 3>&-
+    INTERACTIVE_MENU_TTY_OPEN=0
+  fi
+}
+
+select_modules_interactively() {
+  local current=0
+  local escape_sequence
+  local index
+  local key
+  local marker
+  local menu_line_count
+  local message=""
+  local module
+  local rendered=0
+  local selected_count
+  local selected=()
+
+  exec 3<>/dev/tty 2>/dev/null || return 1
+  INTERACTIVE_MENU_TTY_OPEN=1
+  trap 'cleanup_interactive_menu' EXIT
+  trap 'cleanup_interactive_menu; exit 130' INT TERM HUP
+
+  for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
+    selected[index]=1
+  done
+
+  menu_line_count=$((${#MODULE_ORDER[@]} + 3))
+  printf '\033[?25l' >&3
+
+  while true; do
+    if [ "$rendered" -eq 1 ]; then
+      printf '\033[%dA' "$menu_line_count" >&3
+    fi
+
+    printf '\033[2K\rSelect modules to install\n' >&3
+    printf '\033[2K\rUse Up/Down to move, Space to toggle, Enter to confirm.\n' >&3
+
+    for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
+      module="${MODULE_ORDER[$index]}"
+      marker=" "
+      [ "${selected[$index]}" -eq 1 ] && marker="x"
+
+      if [ "$index" -eq "$current" ]; then
+        printf '\033[2K\r\033[7m> [%s] %-28s %s\033[0m\n' \
+          "$marker" "$module" "$(module_description "$module")" >&3
+      else
+        printf '\033[2K\r  [%s] %-28s %s\n' \
+          "$marker" "$module" "$(module_description "$module")" >&3
+      fi
+    done
+
+    printf '\033[2K\r%s\n' "$message" >&3
+    rendered=1
+    message=""
+    key=""
+
+    if ! IFS= read -rsn1 key <&3; then
+      cleanup_interactive_menu
+      trap - EXIT INT TERM HUP
+      return 1
+    fi
+
+    case "$key" in
+      $'\033')
+        escape_sequence=""
+        IFS= read -rsn2 -t 0.1 escape_sequence <&3 || true
+        case "$escape_sequence" in
+          '[A') current=$(((current + ${#MODULE_ORDER[@]} - 1) % ${#MODULE_ORDER[@]})) ;;
+          '[B') current=$(((current + 1) % ${#MODULE_ORDER[@]})) ;;
+        esac
+        ;;
+      ' ')
+        if [ "${selected[$current]}" -eq 1 ]; then
+          selected[current]=0
+        else
+          selected[current]=1
+        fi
+        ;;
+      '')
+        selected_count=0
+        INTERACTIVE_SELECTED_MODULES=""
+        for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
+          if [ "${selected[$index]}" -eq 1 ]; then
+            module="${MODULE_ORDER[$index]}"
+            if [ -z "$INTERACTIVE_SELECTED_MODULES" ]; then
+              INTERACTIVE_SELECTED_MODULES="$module"
+            else
+              INTERACTIVE_SELECTED_MODULES="$INTERACTIVE_SELECTED_MODULES $module"
+            fi
+            selected_count=$((selected_count + 1))
+          fi
+        done
+
+        if [ "$selected_count" -eq 0 ]; then
+          message="Select at least one module."
+          continue
+        fi
+
+        cleanup_interactive_menu
+        trap - EXIT INT TERM HUP
+        return 0
+        ;;
+    esac
+  done
+}
+
 usage() {
   cat <<EOF
 Usage: ubuntu_init.sh [options] [module ...]
 
-Run every module (default) or only the modules named on the command line.
+With no arguments in an interactive terminal, choose modules from the menu.
+Without a controlling terminal, an argument-free run executes every module.
+Pass module names to run only those modules.
 Selected modules always run in their canonical order.
 
 Options:
   -l, --list   List available modules and exit
   -h, --help   Show this help and exit
+
+Arguments:
+  all          Run every module without opening the interactive menu
 
 Modules:
 $(list_modules)
@@ -411,6 +533,7 @@ is_selected_module() {
 }
 
 main() {
+  local original_arg_count="$#"
   local run_all=1
   local selected_modules=""
 
@@ -439,6 +562,12 @@ main() {
     esac
     shift
   done
+
+  if [ "$original_arg_count" -eq 0 ] && has_controlling_terminal; then
+    select_modules_interactively || die "Unable to read the interactive selection."
+    selected_modules="$INTERACTIVE_SELECTED_MODULES"
+    run_all=0
+  fi
 
   log_step "Checking operating system"
   require_supported_os

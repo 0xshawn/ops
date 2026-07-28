@@ -67,12 +67,21 @@ unsupported_os_fails_before_root_check() {
   local status
 
   set +e
-  output="$(OS_RELEASE_FILE="$os_release_file" bash "$ROOT_DIR/ubuntu_init.sh" 2>&1)"
+  output="$(OS_RELEASE_FILE="$os_release_file" bash "$ROOT_DIR/ubuntu_init.sh" all 2>&1)"
   status=$?
 
   [ "$status" -eq 1 ] &&
     grep -q "Error: This script is only supported on Ubuntu >= 24.04." <<<"$output" &&
+    ! grep -q "Use Up/Down" <<<"$output" &&
     ! grep -q "Please run as root" <<<"$output"
+}
+
+help_describes_interactive_menu() {
+  local output
+
+  output="$(bash "$ROOT_DIR/ubuntu_init.sh" --help)" &&
+    grep -q "With no arguments in an interactive terminal, choose modules from the menu." <<<"$output" &&
+    grep -q "Run every module without opening the interactive menu" <<<"$output"
 }
 
 supports_normal_user_entrypoint() {
@@ -252,6 +261,8 @@ check "README lists Node module" readme_lists_node_module
 check "README lists zsh module" readme_lists_zsh_module
 check "ubuntu_init.sh logs progress" has_step_logging
 check "welcome message disable uses target user" disable_welcome_message_uses_target_user
+check "interactive menu behavior" python3 "$ROOT_DIR/tests/interactive_menu_test.py"
+check "help describes interactive menu" help_describes_interactive_menu
 
 if [ "$failures" -ne 0 ]; then
   exit 1

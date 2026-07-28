@@ -12,12 +12,28 @@ curl -fsSL https://raw.githubusercontent.com/0xshawn/ops/main/ubuntu_init.sh | b
 
 The script uses sudo for system changes and exits on non-Ubuntu systems or Ubuntu versions older than 24.04.
 
-## Selective modules
+## Interactive selection
 
-With no arguments the script runs every module. Pass module names to run only
-those (they always execute in their canonical order):
+No arguments in an interactive terminal open the module selection menu:
 
 ```bash
+./ubuntu_init.sh
+```
+
+Every module is selected initially. Use Up and Down to move, Space to toggle a
+module, and Enter to confirm. At least one module must remain selected.
+
+The menu reads from the controlling terminal, so it also works with the remote
+execution command above. If no controlling terminal is available, an
+argument-free run keeps the previous behavior and runs every module.
+
+## Command-line selection
+
+Pass `all` to run every module without opening the menu, or pass module names
+to run only those modules. Selected modules always execute in canonical order:
+
+```bash
+./ubuntu_init.sh all
 ./ubuntu_init.sh disable_welcome_message
 curl -fsSL https://raw.githubusercontent.com/0xshawn/ops/main/ubuntu_init.sh | bash -s -- disable_welcome_message
 ```
