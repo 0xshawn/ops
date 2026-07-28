@@ -268,8 +268,12 @@ install_docker() {
   if command -v docker >/dev/null 2>&1; then
     log_step "Docker is already installed; skipping installer"
   else
+    run_as_root mkdir -p /etc/apt/sources.list.d
     wget -qO- get.docker.com | run_as_root bash
   fi
+
+  command -v docker >/dev/null 2>&1 ||
+    die "Docker installation completed without installing the docker command."
 
   run_as_root systemctl enable docker
   run_as_root systemctl restart docker
