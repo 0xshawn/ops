@@ -11,7 +11,7 @@ set -euo pipefail
 #   curl -fsSL <url-to-this-script> | bash
 #   curl -fsSL <url-to-this-script> | bash -s -- disable_welcome_message
 
-readonly MIN_UBUNTU_MAJOR=24
+readonly MIN_UBUNTU_MAJOR=22
 readonly MIN_UBUNTU_MINOR=4
 readonly DOCKER_DATA_ROOT="/data/docker"
 readonly OS_RELEASE_PATH="${OS_RELEASE_FILE:-/etc/os-release}"
