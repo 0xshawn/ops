@@ -19,6 +19,8 @@ MODULES = [
     "install_common_tools",
     "initialize_zsh",
     "install_node",
+    "install_codex",
+    "install_code_review_graph",
     "set_default_editor",
     "configure_docker",
     "install_docker",
@@ -115,6 +117,7 @@ select_modules_interactively() { return 1; }
 require_supported_os() { :; }
 init_target_user() { :; }
 require_sudo() { :; }
+run_task() { shift; "$@"; }
 for module in "${MODULE_ORDER[@]}"; do
   eval "$module() { printf 'RUN:%s\\n' '$module'; }"
 done
