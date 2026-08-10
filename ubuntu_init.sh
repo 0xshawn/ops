@@ -339,6 +339,55 @@ install_node() {
   '
 }
 
+target_user_has_command() {
+  local command_name="$1"
+
+  run_as_target_user bash -c '
+    export PATH="$HOME/.local/bin:$PATH"
+    export NVM_DIR="$HOME/.nvm"
+    [ ! -s "$NVM_DIR/nvm.sh" ] || . "$NVM_DIR/nvm.sh"
+    command -v "$1" >/dev/null 2>&1
+  ' bash "$command_name"
+}
+
+install_codex() {
+  if target_user_has_command codex; then
+    return "$TASK_SKIPPED"
+  fi
+
+  if ! target_user_has_command node; then
+    install_node
+  fi
+
+  run_as_target_user bash -c '
+    set -euo pipefail
+    curl -fsSL https://chatgpt.com/codex/install.sh | sh
+  '
+
+  if ! target_user_has_command codex; then
+    die "Codex installation completed without installing the codex command."
+    return 1
+  fi
+}
+
+install_code_review_graph() {
+  if target_user_has_command code-review-graph; then
+    return "$TASK_SKIPPED"
+  fi
+
+  if ! target_user_has_command pipx; then
+    run_as_root apt update
+    run_as_root apt install -y pipx
+  fi
+
+  run_as_target_user pipx install code-review-graph
+
+  if ! target_user_has_command code-review-graph; then
+    die "code-review-graph installation completed without installing the code-review-graph command."
+    return 1
+  fi
+}
+
 set_default_editor() {
   run_as_root update-alternatives --set editor /usr/bin/vim.basic
 }
@@ -435,6 +484,8 @@ readonly MODULE_ORDER=(
   install_common_tools
   initialize_zsh
   install_node
+  install_codex
+  install_code_review_graph
   set_default_editor
   configure_docker
   install_docker
@@ -451,6 +502,8 @@ module_description() {
     install_common_tools) printf '%s' "Installing common tools" ;;
     initialize_zsh) printf '%s' "Initializing zsh" ;;
     install_node) printf '%s' "Installing Node.js" ;;
+    install_codex) printf '%s' "Installing Codex" ;;
+    install_code_review_graph) printf '%s' "Installing code-review-graph" ;;
     set_default_editor) printf '%s' "Setting default editor" ;;
     configure_docker) printf '%s' "Configuring Docker" ;;
     install_docker) printf '%s' "Installing Docker" ;;
