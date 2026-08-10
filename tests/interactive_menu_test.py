@@ -71,6 +71,11 @@ def first_render(output: str) -> str:
     return first.split("Select modules to install", 1)[0].split("\nRESULT:", 1)[0]
 
 
+def final_render(output: str) -> str:
+    _, _, final = output.rpartition("Select modules to install")
+    return final.split("\nRESULT:", 1)[0]
+
+
 def run_pty(argv: list[str], input_bytes: bytes = b"", wait_for: bytes | None = None) -> tuple[int, str]:
     pid, fd = pty.fork()
     if pid == 0:
@@ -183,6 +188,7 @@ class InteractiveMenuTest(unittest.TestCase):
         output, _ = self.run_menu(b"\x1b[C\x1b[D\r")
         self.assertIn("install_common_tools", output)
         self.assertGreaterEqual(output.count("Base tools"), 2)
+        self.assertNotIn("install_common_tools", final_render(output))
 
     def test_space_clears_an_entire_category(self) -> None:
         _, selected = self.run_menu(b" \r")
