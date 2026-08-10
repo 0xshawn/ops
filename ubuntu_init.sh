@@ -17,6 +17,8 @@ readonly DOCKER_DATA_ROOT="/data/docker"
 readonly OS_RELEASE_PATH="${OS_RELEASE_FILE:-/etc/os-release}"
 readonly SUDO_BIN="${SUDO_BIN:-sudo}"
 readonly TASK_SKIPPED=20
+readonly TASK_TERMINATION_GRACE_ATTEMPTS=20
+readonly TASK_TERMINATION_KILL_ATTEMPTS=40
 
 TARGET_USER=""
 TARGET_HOME=""
@@ -37,23 +39,145 @@ log_step() {
   printf '\n==> %s\n' "$1"
 }
 
-terminate_task_process_tree() {
+task_process_details() {
+  local details=()
+  local pid="$1"
+  local stat
+
+  if ! IFS= read -r stat <"/proc/$pid/stat" 2>/dev/null; then
+    if is_root || ! command -v "$SUDO_BIN" >/dev/null 2>&1; then
+      return 1
+    fi
+    stat="$("$SUDO_BIN" -n cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+  fi
+  read -r -a details <<<"${stat##*) }"
+  [ "${#details[@]}" -ge 20 ] || return 1
+  printf '%s %s\n' "${details[19]}" "${details[0]}"
+}
+
+task_process_matches() {
+  local current_start
+  local expected_start="$2"
+  local pid="$1"
+  local state
+
+  read -r current_start state < <(task_process_details "$pid") || return 1
+  [ "$current_start" = "$expected_start" ]
+}
+
+task_process_children() {
   local child
+  local child_file
   local children=""
+  local inspected=0
+  local pid="$1"
+  local -A seen=()
+
+  for child_file in "/proc/$pid"/task/*/children; do
+    [ -e "$child_file" ] || continue
+    children=""
+    if [ -r "$child_file" ]; then
+      inspected=1
+      IFS= read -r children <"$child_file" || true
+    elif ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
+      if children="$("$SUDO_BIN" -n cat "$child_file" 2>/dev/null)"; then
+        inspected=1
+      else
+        children=""
+      fi
+    fi
+    for child in $children; do
+      if [ -z "${seen[$child]:-}" ]; then
+        seen[$child]=1
+        printf '%s\n' "$child"
+      fi
+    done
+  done
+
+  if [ "$inspected" -eq 0 ] && ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
+    children="$("$SUDO_BIN" -n /bin/sh -c 'cat "/proc/$1"/task/*/children' sh "$pid" 2>/dev/null)" || children=""
+    for child in $children; do
+      if [ -z "${seen[$child]:-}" ]; then
+        seen[$child]=1
+        printf '%s\n' "$child"
+      fi
+    done
+  fi
+}
+
+signal_task_process() {
+  local expected_start="$3"
+  local pid="$2"
+  local task_signal="$1"
+
+  task_process_matches "$pid" "$expected_start" || return 0
+  if kill "-$task_signal" "$pid" 2>/dev/null; then
+    return 0
+  fi
+  task_process_matches "$pid" "$expected_start" || return 0
+  if ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
+    "$SUDO_BIN" -n /bin/kill "-$task_signal" "$pid" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+terminate_task_process_children() {
+  local child
+  local child_start
+  local child_state
   local pid="$1"
 
-  if [ -r "/proc/$pid/task/$pid/children" ]; then
-    IFS= read -r children <"/proc/$pid/task/$pid/children" || true
-  fi
-  for child in $children; do
-    terminate_task_process_tree "$child"
+  while read -r child; do
+    [ -n "$child" ] || continue
+    read -r child_start child_state < <(task_process_details "$child") || continue
+    terminate_task_process_tree "$child" "$child_start" || true
+  done < <(task_process_children "$pid")
+}
+
+wait_for_task_process_stop() {
+  local attempts
+  local current_start
+  local expected_start="$2"
+  local limit="$3"
+  local pid="$1"
+  local state
+
+  for ((attempts = 0; attempts < limit; attempts++)); do
+    terminate_task_process_children "$pid"
+    if ! read -r current_start state < <(task_process_details "$pid") || [ "$current_start" != "$expected_start" ]; then
+      return 0
+    fi
+    if [ "$state" = Z ] || [ "$state" = X ]; then
+      return 0
+    fi
+    sleep 0.05
   done
-  kill -TERM "$pid" 2>/dev/null || true
+  return 1
+}
+
+terminate_task_process_tree() {
+  local expected_start="${2:-}"
+  local pid="$1"
+  local start
+  local state
+
+  read -r start state < <(task_process_details "$pid") || return 0
+  [ -z "$expected_start" ] || [ "$start" = "$expected_start" ] || return 0
+
+  terminate_task_process_children "$pid"
+  signal_task_process TERM "$pid" "$start" || true
+  wait_for_task_process_stop "$pid" "$start" "$TASK_TERMINATION_GRACE_ATTEMPTS" && return 0
+
+  signal_task_process KILL "$pid" "$start" || true
+  wait_for_task_process_stop "$pid" "$start" "$TASK_TERMINATION_KILL_ATTEMPTS" && return 0
+
+  printf 'Warning: unable to stop task process %s.\n' "$pid" >&2
+  return 1
 }
 
 cleanup_task_status() {
   if [ -n "$TASK_COMMAND_PID" ]; then
-    terminate_task_process_tree "$TASK_COMMAND_PID"
+    terminate_task_process_tree "$TASK_COMMAND_PID" || true
     wait "$TASK_COMMAND_PID" 2>/dev/null || true
   fi
 
@@ -82,9 +206,11 @@ cleanup_task_status() {
 }
 
 handle_task_signal() {
+  local status="$1"
+
   trap - EXIT INT TERM HUP
   cleanup_task_status
-  exit 130
+  exit "$status"
 }
 
 render_spinner() {
@@ -969,7 +1095,9 @@ main() {
   fi
 
   trap 'cleanup_task_status' EXIT
-  trap 'handle_task_signal' INT TERM HUP
+  trap 'handle_task_signal 130' INT
+  trap 'handle_task_signal 143' TERM
+  trap 'handle_task_signal 129' HUP
 
   run_task "Checking operating system" require_supported_os
   run_task "Resolving target user" init_target_user

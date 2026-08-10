@@ -38,17 +38,39 @@ def run_driver(command: str) -> subprocess.CompletedProcess[str]:
 
 
 def run_signaled_task_driver(
-    directory: Path, task_signal: signal.Signals
+    directory: Path,
+    task_signal: signal.Signals,
+    *,
+    term_resistant_descendant: bool = False,
 ) -> tuple[int, bytes, Path, int]:
     driver = directory / "signaled_task_driver.sh"
     log_record = directory / "task-log-path"
     external_pid_record = directory / "external-pid"
     long_command = directory / "long-command.sh"
-    long_command.write_text(
-        "#!/bin/bash\n"
-        "printf '%s\\n' \"$$\" >\"$EXTERNAL_PID_RECORD\"\n"
-        "exec /bin/sleep 30\n"
-    )
+    if term_resistant_descendant:
+        resistant_command = directory / "term-resistant-command.py"
+        resistant_command.write_text(
+            "import os\n"
+            "import signal\n"
+            "import sys\n"
+            "\n"
+            "for task_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+            "    signal.signal(task_signal, signal.SIG_IGN)\n"
+            "with open(sys.argv[1], 'w') as pid_file:\n"
+            "    pid_file.write(f'{os.getpid()}\\n')\n"
+            "while True:\n"
+            "    signal.pause()\n"
+        )
+        long_command.write_text(
+            "#!/bin/bash\n"
+            f"python3 {resistant_command} \"$EXTERNAL_PID_RECORD\"\n"
+        )
+    else:
+        long_command.write_text(
+            "#!/bin/bash\n"
+            "printf '%s\\n' \"$$\" >\"$EXTERNAL_PID_RECORD\"\n"
+            "exec /bin/sleep 30\n"
+        )
     long_command.chmod(0o755)
     driver.write_text(
         script_definitions()
@@ -227,8 +249,13 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("TARGET:test-user:/tmp:test-group", result.stdout)
 
-    def test_task_signals_stop_external_command_and_cleanup(self):
-        for task_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    def test_task_signals_preserve_status_and_cleanup(self):
+        expected_statuses = {
+            signal.SIGINT: 130,
+            signal.SIGTERM: 143,
+            signal.SIGHUP: 129,
+        }
+        for task_signal, expected_status in expected_statuses.items():
             with self.subTest(task_signal=task_signal):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     status, output, log_record, external_pid = run_signaled_task_driver(
@@ -236,7 +263,7 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
                     )
                     self.assertTrue(log_record.exists(), output)
                     task_log = Path(log_record.read_text().strip())
-                    self.assertEqual(status, 130, output)
+                    self.assertEqual(status, expected_status, output)
                     self.assertIn(b"\x1b[?25l", output)
                     self.assertIn(b"\x1b[?25h", output)
                     self.assertFalse(task_log.exists(), output)
@@ -244,6 +271,26 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
                         os.kill(external_pid, 0)
                     after_restore = output.rsplit(b"\x1b[?25h", 1)[-1]
                     self.assertNotIn(b"Installing common tools", after_restore)
+
+    def test_task_signal_kills_term_resistant_descendant_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            status, output, log_record, external_pid = run_signaled_task_driver(
+                Path(temporary_directory),
+                signal.SIGTERM,
+                term_resistant_descendant=True,
+            )
+            self.assertTrue(log_record.exists(), output)
+            task_log = Path(log_record.read_text().strip())
+            try:
+                self.assertEqual(status, 143, output)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(external_pid, 0)
+                self.assertFalse(task_log.exists(), output)
+            finally:
+                try:
+                    os.kill(external_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_die_stops_task_before_later_commands(self):
         result = run_driver(
