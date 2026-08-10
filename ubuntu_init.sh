@@ -43,7 +43,9 @@ cleanup_task_status() {
     wait "$TASK_SPINNER_PID" 2>/dev/null || true
   fi
 
-  [ -t 1 ] && printf '\033[?25h'
+  if [ -n "$TASK_LOG_FILE" ] && [ -t 1 ]; then
+    printf '\033[?25h'
+  fi
 
   if [ -n "$TASK_LOG_FILE" ]; then
     rm -f "$TASK_LOG_FILE"
@@ -51,6 +53,12 @@ cleanup_task_status() {
 
   TASK_LOG_FILE=""
   TASK_SPINNER_PID=""
+}
+
+handle_task_signal() {
+  trap - EXIT INT TERM HUP
+  cleanup_task_status
+  exit 130
 }
 
 render_spinner() {
@@ -71,7 +79,7 @@ run_task() {
   local description="$1"
   local status
   shift
-  TASK_LOG_FILE="$(mktemp)"
+  TASK_LOG_FILE="$(mktemp)" || return
 
   if [ -t 1 ]; then
     printf '\033[?25l'
@@ -81,10 +89,11 @@ run_task() {
     printf 'START %s\n' "$description"
   fi
 
-  set +e
-  "$@" >"$TASK_LOG_FILE" 2>&1
-  status=$?
-  set -e
+  if "$@" >"$TASK_LOG_FILE" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
 
   if [ -n "$TASK_SPINNER_PID" ]; then
     kill "$TASK_SPINNER_PID" 2>/dev/null || true
@@ -154,11 +163,11 @@ run_as_root() {
 run_as_target_user() {
   local target_shell
 
-  target_shell="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
+  target_shell="$(getent passwd "$TARGET_USER" | cut -d: -f7)" || return
   [ -n "$target_shell" ] || target_shell="${SHELL:-/bin/sh}"
 
   if [ "$TARGET_USER" = "$(id -un)" ]; then
-    HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
+    HOME="$TARGET_HOME" SHELL="$target_shell" PATH="$TARGET_HOME/.local/bin:$PATH" "$@"
     return
   fi
 
@@ -167,21 +176,32 @@ run_as_target_user() {
       die "This script requires runuser to switch to $TARGET_USER."
       return 1
     }
-    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
+    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" SHELL="$target_shell" \
+      PATH="$TARGET_HOME/.local/bin:$PATH" "$@"
     return
   fi
 
-  "$SUDO_BIN" -H -u "$TARGET_USER" env HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
+  "$SUDO_BIN" -H -u "$TARGET_USER" env HOME="$TARGET_HOME" SHELL="$target_shell" \
+    PATH="$TARGET_HOME/.local/bin:$PATH" "$@"
 }
 
 write_root_file() {
   local path="$1"
   local mode="${2:-0644}"
+  local status
   local tmp_file
 
-  tmp_file="$(mktemp)"
-  cat >"$tmp_file"
-  run_as_root install -m "$mode" -D "$tmp_file" "$path"
+  tmp_file="$(mktemp)" || return
+  cat >"$tmp_file" || {
+    status=$?
+    rm -f "$tmp_file"
+    return "$status"
+  }
+  run_as_root install -m "$mode" -D "$tmp_file" "$path" || {
+    status=$?
+    rm -f "$tmp_file"
+    return "$status"
+  }
   rm -f "$tmp_file"
 }
 
@@ -269,11 +289,11 @@ init_target_user() {
   if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     TARGET_USER="$SUDO_USER"
   else
-    TARGET_USER="$(id -un)"
+    TARGET_USER="$(id -un)" || return
   fi
 
-  TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
-  TARGET_GROUP="$(id -gn "$TARGET_USER")"
+  TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)" || return
+  TARGET_GROUP="$(id -gn "$TARGET_USER")" || return
 
   [ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ] ||
     die "Cannot determine home directory for $TARGET_USER."
@@ -299,7 +319,7 @@ install_common_tools() {
     build-essential
   )
 
-  run_as_root apt update
+  run_as_root apt update || return
   run_as_root apt install -y "${packages[@]}"
 }
 
@@ -312,7 +332,7 @@ initialize_zsh() {
     return
   fi
 
-  run_as_root chsh -s "$zsh_path" "$TARGET_USER"
+  run_as_root chsh -s "$zsh_path" "$TARGET_USER" || return
   run_as_target_user zsh -lc '
     set -euo pipefail
 
@@ -356,13 +376,13 @@ install_codex() {
   fi
 
   if ! target_user_has_command node; then
-    install_node
+    install_node || return
   fi
 
   run_as_target_user bash -c '
     set -euo pipefail
     curl -fsSL https://chatgpt.com/codex/install.sh | sh
-  '
+  ' || return
 
   if ! target_user_has_command codex; then
     die "Codex installation completed without installing the codex command."
@@ -376,11 +396,11 @@ install_code_review_graph() {
   fi
 
   if ! target_user_has_command pipx; then
-    run_as_root apt update
-    run_as_root apt install -y pipx
+    run_as_root apt update || return
+    run_as_root apt install -y pipx || return
   fi
 
-  run_as_target_user pipx install code-review-graph
+  run_as_target_user pipx install code-review-graph || return
 
   if ! target_user_has_command code-review-graph; then
     die "code-review-graph installation completed without installing the code-review-graph command."
@@ -393,7 +413,7 @@ set_default_editor() {
 }
 
 configure_docker() {
-  run_as_root mkdir -p "$DOCKER_DATA_ROOT"
+  run_as_root mkdir -p "$DOCKER_DATA_ROOT" || return
   write_root_file "/etc/docker/daemon.json" <<EOL
 {
   "data-root": "$DOCKER_DATA_ROOT",
@@ -410,8 +430,8 @@ install_docker() {
   if command -v docker >/dev/null 2>&1; then
     log_step "Docker is already installed; skipping installer"
   else
-    run_as_root mkdir -p /etc/apt/sources.list.d
-    wget -qO- get.docker.com | run_as_root bash
+    run_as_root mkdir -p /etc/apt/sources.list.d || return
+    wget -qO- get.docker.com | run_as_root bash || return
   fi
 
   command -v docker >/dev/null 2>&1 || {
@@ -419,7 +439,7 @@ install_docker() {
     return 1
   }
 
-  run_as_root systemctl enable docker
+  run_as_root systemctl enable docker || return
   run_as_root systemctl restart docker
 }
 
@@ -442,20 +462,20 @@ EOL
 }
 
 configure_journald() {
-  write_root_file "/etc/systemd/journald.conf.d/00-journal-limit.conf" <<EOL
+  write_root_file "/etc/systemd/journald.conf.d/00-journal-limit.conf" <<EOL || return
 [Journal]
 SystemMaxUse=1G
 SystemMaxFileSize=200M
 MaxRetentionSec=14day
 EOL
-  run_as_root systemctl restart systemd-journal-flush.service
+  run_as_root systemctl restart systemd-journal-flush.service || return
   run_as_root systemctl restart systemd-journald
 }
 
 configure_logrotate() {
   if run_as_root test -f /etc/logrotate.conf; then
     if ! run_as_root grep -q "maxsize" /etc/logrotate.conf; then
-      run_as_root sed -i '/^# global options/a \    maxsize 1G' /etc/logrotate.conf
+      run_as_root sed -i '/^# global options/a \    maxsize 1G' /etc/logrotate.conf || return
     fi
     run_as_root sed -i 's/#compress/compress/g' /etc/logrotate.conf
   fi
@@ -473,7 +493,7 @@ disable_welcome_message() {
   if [ "$TARGET_USER" = "$(id -un)" ] && ! is_root; then
     touch "$TARGET_HOME/.hushlogin"
   else
-    run_as_root touch "$TARGET_HOME/.hushlogin"
+    run_as_root touch "$TARGET_HOME/.hushlogin" || return
     run_as_root chown "$TARGET_USER":"$TARGET_GROUP" "$TARGET_HOME/.hushlogin"
   fi
 }
@@ -897,6 +917,9 @@ main() {
     run_all=0
   fi
 
+  trap 'cleanup_task_status' EXIT
+  trap 'handle_task_signal' INT TERM HUP
+
   run_task "Checking operating system" require_supported_os
   run_task "Resolving target user" init_target_user
   run_task "Checking sudo privileges" require_sudo
@@ -908,6 +931,8 @@ main() {
     fi
   done
 
+  cleanup_task_status
+  trap - EXIT INT TERM HUP
   log_step "Done."
 }
 
