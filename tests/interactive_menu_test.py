@@ -5,6 +5,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -19,10 +20,31 @@ MODULES = [
     "install_common_tools",
     "initialize_zsh",
     "install_node",
+    "install_codex",
+    "install_code_review_graph",
     "set_default_editor",
     "configure_docker",
     "install_docker",
     "configure_vim",
+    "configure_passwordless_sudo",
+    "configure_journald",
+    "configure_logrotate",
+    "disable_apt_daily_timers",
+    "disable_welcome_message",
+]
+BASE_TOOLS = [
+    "install_common_tools",
+    "initialize_zsh",
+    "set_default_editor",
+    "configure_vim",
+]
+DEVELOPMENT_TOOLS = [
+    "install_node",
+    "install_codex",
+    "install_code_review_graph",
+]
+DOCKER = ["configure_docker", "install_docker"]
+SYSTEM_CONFIGURATION = [
     "configure_passwordless_sudo",
     "configure_journald",
     "configure_logrotate",
@@ -42,6 +64,16 @@ def script_definitions() -> str:
 
 def clean_output(output: bytes) -> str:
     return ANSI_ESCAPE.sub(b"", output).decode(errors="replace").replace("\r", "")
+
+
+def first_render(output: str) -> str:
+    _, _, first = output.partition("Select modules to install")
+    return first.split("Select modules to install", 1)[0].split("\nRESULT:", 1)[0]
+
+
+def final_render(output: str) -> str:
+    _, _, final = output.rpartition("Select modules to install")
+    return final.split("\nRESULT:", 1)[0]
 
 
 def run_pty(argv: list[str], input_bytes: bytes = b"", wait_for: bytes | None = None) -> tuple[int, str]:
@@ -100,8 +132,9 @@ def create_menu_driver(directory: Path) -> Path:
     return driver
 
 
-def create_main_driver(directory: Path, force_menu_failure: bool = False) -> Path:
+def create_main_driver(directory: Path, force_menu_failure: bool = False) -> tuple[Path, Path]:
     driver = directory / "main_driver.sh"
+    trace_file = directory / "trace"
     menu_overrides = ""
     if force_menu_failure:
         menu_overrides = """
@@ -111,17 +144,18 @@ select_modules_interactively() { return 1; }
     driver.write_text(
         script_definitions()
         + menu_overrides
-        + """
-require_supported_os() { :; }
-init_target_user() { :; }
-require_sudo() { :; }
-for module in "${MODULE_ORDER[@]}"; do
-  eval "$module() { printf 'RUN:%s\\n' '$module'; }"
+        + f"""
+TRACE_FILE={shlex.quote(str(trace_file))}
+require_supported_os() {{ :; }}
+init_target_user() {{ :; }}
+require_sudo() {{ :; }}
+for module in "${{MODULE_ORDER[@]}}"; do
+  eval "$module() {{ printf '%s\\n' '$module' >>\"$TRACE_FILE\"; }}"
 done
 main "$@"
 """
     )
-    return driver
+    return driver, trace_file
 
 
 def selected_modules(output: str) -> list[str]:
@@ -143,33 +177,52 @@ class InteractiveMenuTest(unittest.TestCase):
         self.assertEqual(status, 0, output)
         return output, selected_modules(output)
 
-    def test_enter_accepts_all_modules_selected_by_default(self) -> None:
-        _, selected = self.run_menu(b"\r")
+    def test_categories_start_collapsed_and_all_modules_selected(self) -> None:
+        output, selected = self.run_menu(b"\r")
         self.assertEqual(selected, MODULES)
+        self.assertIn("[x] Base tools", output)
+        self.assertIn("[x] Development tools", output)
+        self.assertNotIn("install_common_tools", first_render(output))
 
-    def test_up_down_and_space_toggle_modules(self) -> None:
-        _, selected = self.run_menu(b"\x1b[B \x1b[A \r")
-        self.assertEqual(selected, MODULES[2:])
+    def test_right_expands_and_left_collapses_category(self) -> None:
+        output, _ = self.run_menu(b"\x1b[C\x1b[D\r")
+        self.assertIn("install_common_tools", output)
+        self.assertGreaterEqual(output.count("Base tools"), 2)
+        self.assertNotIn("install_common_tools", final_render(output))
 
-    def test_space_on_clear_action_clears_all_and_focuses_first_module(self) -> None:
-        output, selected = self.run_menu(b"\x1b[A  \r")
+    def test_space_clears_an_entire_category(self) -> None:
+        _, selected = self.run_menu(b" \r")
+        self.assertEqual(selected, [module for module in MODULES if module not in BASE_TOOLS])
+
+    def test_child_toggle_gives_category_partial_marker(self) -> None:
+        output, selected = self.run_menu(b"\x1b[C\x1b[B \r")
+        self.assertNotIn("install_common_tools", selected)
+        self.assertIn("[-] Base tools", output)
+
+    def test_space_on_clear_action_clears_all_and_focuses_first_category(self) -> None:
+        output, selected = self.run_menu(b"\x1b[A \r \r")
         self.assertIn("[ Clear all selections ]", output)
         self.assertNotIn("[x] Clear all selections", output)
-        self.assertEqual(selected, ["install_common_tools"])
-
-    def test_enter_on_clear_action_clears_all(self) -> None:
-        _, selected = self.run_menu(b"\x1b[A\r\x1b[B \r")
-        self.assertEqual(selected, ["initialize_zsh"])
+        self.assertEqual(selected, BASE_TOOLS)
 
     def test_empty_selection_is_rejected(self) -> None:
-        keys = b" " + (b"\x1b[B " * (len(MODULES) - 1)) + b"\r \r"
-        output, selected = self.run_menu(keys)
+        output, selected = self.run_menu(b"\x1b[A \r \r")
         self.assertIn("Select at least one module.", output)
-        self.assertEqual(selected, ["disable_welcome_message"])
+        self.assertEqual(selected, BASE_TOOLS)
+
+    def test_categories_are_not_command_line_modules(self) -> None:
+        result = subprocess.run(
+            ["/bin/bash", str(SCRIPT_PATH), "docker"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unknown module: docker", result.stderr)
 
     def test_no_tty_runs_all_and_module_arguments_keep_canonical_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            driver = create_main_driver(Path(temporary_directory))
+            directory = Path(temporary_directory)
+            driver, trace_file = create_main_driver(directory)
             run_all = subprocess.run(
                 ["/bin/bash", str(driver)],
                 stdin=subprocess.DEVNULL,
@@ -178,6 +231,8 @@ class InteractiveMenuTest(unittest.TestCase):
                 check=True,
                 start_new_session=True,
             )
+            run_all_trace = trace_file.read_text().splitlines()
+            trace_file.unlink()
             selected = subprocess.run(
                 [
                     "/bin/bash",
@@ -191,13 +246,13 @@ class InteractiveMenuTest(unittest.TestCase):
                 check=True,
                 start_new_session=True,
             )
+            selected_trace = trace_file.read_text().splitlines()
 
+        self.assertEqual(run_all.stderr, "")
+        self.assertEqual(run_all_trace, MODULES)
+        self.assertEqual(selected.stderr, "")
         self.assertEqual(
-            re.findall(r"^RUN:(.*)$", run_all.stdout, flags=re.MULTILINE),
-            MODULES,
-        )
-        self.assertEqual(
-            re.findall(r"^RUN:(.*)$", selected.stdout, flags=re.MULTILINE),
+            selected_trace,
             ["install_common_tools", "disable_welcome_message"],
         )
 
@@ -209,7 +264,7 @@ class InteractiveMenuTest(unittest.TestCase):
 
     def test_menu_read_failure_aborts_instead_of_running_all_modules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            driver = create_main_driver(
+            driver, trace_file = create_main_driver(
                 Path(temporary_directory),
                 force_menu_failure=True,
             )
@@ -220,9 +275,11 @@ class InteractiveMenuTest(unittest.TestCase):
                 text=True,
                 start_new_session=True,
             )
+            trace_exists = trace_file.exists()
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("RUN:", result.stdout)
+        self.assertFalse(trace_exists)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -158,6 +158,43 @@ main_installs_node_after_common_tools() {
   ' "$ROOT_DIR/ubuntu_init.sh"
 }
 
+developer_modules_use_canonical_order() {
+  awk '
+    /^readonly MODULE_ORDER=\(/ { in_list = 1 }
+    in_list && /install_node/ { node_line = NR }
+    in_list && /install_codex/ { codex_line = NR }
+    in_list && /install_code_review_graph/ { graph_line = NR }
+    in_list && /^\)/ { in_list = 0 }
+    END {
+      exit !(node_line > 0 && codex_line > node_line && graph_line > codex_line)
+    }
+  ' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+codex_installer_uses_official_pipeline() {
+  grep -Fq 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+code_review_graph_installer_uses_pipx() {
+  grep -Fq 'run_as_root apt install -y pipx' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'run_as_target_user pipx install code-review-graph' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+interactive_menu_defines_categories() {
+  grep -Fq 'readonly CATEGORY_ORDER=(base_tools development_tools docker system_configuration)' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'base_tools) printf '\''%s'\'' "Base tools" ;;' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'development_tools) printf '\''%s'\'' "Development tools" ;;' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'docker) printf '\''%s'\'' "Docker" ;;' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'system_configuration) printf '\''%s'\'' "System configuration" ;;' "$ROOT_DIR/ubuntu_init.sh"
+}
+
+run_task_wraps_setup_checks_and_modules() {
+  grep -Fq 'run_task "Checking operating system" require_supported_os' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'run_task "Resolving target user" init_target_user' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'run_task "Checking sudo privileges" require_sudo' "$ROOT_DIR/ubuntu_init.sh" &&
+    grep -Fq 'run_task "$(module_description "$module")" "$module"' "$ROOT_DIR/ubuntu_init.sh"
+}
+
 main_initializes_zsh_after_common_tools() {
   awk '
     /^readonly MODULE_ORDER=\(/ { in_list = 1 }
@@ -217,6 +254,11 @@ readme_lists_node_module() {
   grep -q '| `install_node` | Install nvm and the latest Node.js LTS release |' "$ROOT_DIR/README.md"
 }
 
+readme_lists_developer_install_modules() {
+  grep -Fq '| `install_codex` | Install Codex CLI for the target user, installing Node.js first when required |' "$ROOT_DIR/README.md" &&
+    grep -Fq '| `install_code_review_graph` | Install code-review-graph for the target user with pipx |' "$ROOT_DIR/README.md"
+}
+
 readme_lists_zsh_module() {
   grep -q "| \`initialize_zsh\` | Set zsh as the target user's shell and install oh-my-zsh and fzf when zsh is available |" "$ROOT_DIR/README.md"
 }
@@ -254,15 +296,23 @@ check "README uses normal user remote command" readme_uses_normal_user_remote_co
 check "ubuntu_init.sh has main entrypoint" has_main_entrypoint
 check "main installs tools before setting editor" main_installs_tools_before_setting_editor
 check "main installs Node after common tools" main_installs_node_after_common_tools
+check "developer modules use canonical order" developer_modules_use_canonical_order
+check "Codex installer uses official pipeline" codex_installer_uses_official_pipeline
+check "code-review-graph installer uses pipx" code_review_graph_installer_uses_pipx
+check "interactive menu defines categories" interactive_menu_defines_categories
+check "task runner wraps setup checks and modules" run_task_wraps_setup_checks_and_modules
 check "main initializes zsh after common tools" main_initializes_zsh_after_common_tools
 check "Node install uses nvm latest LTS" node_install_uses_nvm_lts
 check "zsh initialization installs oh-my-zsh and fzf" zsh_initialization_installs_ohmyzsh_and_fzf
 check "target user commands use target login shell" target_user_commands_use_target_login_shell
 check "README lists Node module" readme_lists_node_module
+check "README lists developer install modules" readme_lists_developer_install_modules
 check "README lists zsh module" readme_lists_zsh_module
 check "ubuntu_init.sh logs progress" has_step_logging
 check "welcome message disable uses target user" disable_welcome_message_uses_target_user
 check "interactive menu behavior" python3 "$ROOT_DIR/tests/interactive_menu_test.py"
+check "task status behavior" python3 "$ROOT_DIR/tests/task_status_test.py"
+check "developer tool installers" python3 "$ROOT_DIR/tests/developer_tools_install_test.py"
 check "help describes interactive menu" help_describes_interactive_menu
 
 if [ "$failures" -ne 0 ]; then
