@@ -497,6 +497,34 @@ readonly MODULE_ORDER=(
   disable_welcome_message
 )
 
+readonly CATEGORY_ORDER=(base_tools development_tools docker system_configuration)
+
+category_description() {
+  case "$1" in
+    base_tools) printf '%s' "Base tools" ;;
+    development_tools) printf '%s' "Development tools" ;;
+    docker) printf '%s' "Docker" ;;
+    system_configuration) printf '%s' "System configuration" ;;
+    *) die "Missing description for category: $1" ;;
+  esac
+}
+
+category_modules() {
+  case "$1" in
+    base_tools)
+      printf '%s' "install_common_tools initialize_zsh set_default_editor configure_vim"
+      ;;
+    development_tools)
+      printf '%s' "install_node install_codex install_code_review_graph"
+      ;;
+    docker) printf '%s' "configure_docker install_docker" ;;
+    system_configuration)
+      printf '%s' "configure_passwordless_sudo configure_journald configure_logrotate disable_apt_daily_timers disable_welcome_message"
+      ;;
+    *) die "Missing modules for category: $1" ;;
+  esac
+}
+
 module_description() {
   case "$1" in
     install_common_tools) printf '%s' "Installing common tools" ;;
@@ -547,16 +575,27 @@ cleanup_interactive_menu() {
 
 select_modules_interactively() {
   local current=0
+  local category
+  local category_child_count
+  local category_index
+  local category_selected_count
   local escape_sequence
+  local expanded=(0 0 0 0)
+  local focused_type
+  local focused_value
   local index
   local key
+  local last_visible_index
   local marker
-  local menu_line_count
+  local menu_line_count=0
   local message=""
   local module
+  local module_index
   local rendered=0
   local selected_count
   local selected=()
+  local visible_types=()
+  local visible_values=()
 
   exec 3<>/dev/tty 2>/dev/null || return 1
   INTERACTIVE_MENU_TTY_OPEN=1
@@ -567,7 +606,6 @@ select_modules_interactively() {
     selected[index]=1
   done
 
-  menu_line_count=$((${#MODULE_ORDER[@]} + 5))
   printf '\033[?25l' >&3
 
   while true; do
@@ -575,8 +613,22 @@ select_modules_interactively() {
       printf '\033[%dA' "$menu_line_count" >&3
     fi
 
+    visible_types=()
+    visible_values=()
+    for ((category_index = 0; category_index < ${#CATEGORY_ORDER[@]}; category_index++)); do
+      category="${CATEGORY_ORDER[$category_index]}"
+      visible_types+=(category)
+      visible_values+=("$category")
+      if [ "${expanded[$category_index]}" -eq 1 ]; then
+        for module in $(category_modules "$category"); do
+          visible_types+=(module)
+          visible_values+=("$module")
+        done
+      fi
+    done
+
     printf '\033[2K\rSelect modules to install\n' >&3
-    printf '\033[2K\rUse Up/Down to move, Space to toggle, Enter to confirm.\n' >&3
+    printf '\033[2K\rUse Up/Down to move, Right/Left to expand/collapse, Space to toggle, Enter to confirm.\n' >&3
 
     if [ "$current" -eq -1 ]; then
       printf '\033[2K\r\033[7m> [ Clear all selections ]\033[0m\n' >&3
@@ -585,22 +637,57 @@ select_modules_interactively() {
     fi
     printf '\033[2K\r----------------------------------------\n' >&3
 
-    for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
-      module="${MODULE_ORDER[$index]}"
+    for ((index = 0; index < ${#visible_values[@]}; index++)); do
+      focused_type="${visible_types[$index]}"
+      focused_value="${visible_values[$index]}"
+
+      if [ "$focused_type" = category ]; then
+        category_selected_count=0
+        category_child_count=0
+        for module in $(category_modules "$focused_value"); do
+          category_child_count=$((category_child_count + 1))
+          for ((module_index = 0; module_index < ${#MODULE_ORDER[@]}; module_index++)); do
+            if [ "${MODULE_ORDER[$module_index]}" = "$module" ] && [ "${selected[$module_index]}" -eq 1 ]; then
+              category_selected_count=$((category_selected_count + 1))
+            fi
+          done
+        done
+
+        marker=" "
+        if [ "$category_selected_count" -eq "$category_child_count" ]; then
+          marker="x"
+        elif [ "$category_selected_count" -gt 0 ]; then
+          marker="-"
+        fi
+
+        if [ "$index" -eq "$current" ]; then
+          printf '\033[2K\r\033[7m> [%s] %s\033[0m\n' \
+            "$marker" "$(category_description "$focused_value")" >&3
+        else
+          printf '\033[2K\r  [%s] %s\n' \
+            "$marker" "$(category_description "$focused_value")" >&3
+        fi
+        continue
+      fi
+
+      for ((module_index = 0; module_index < ${#MODULE_ORDER[@]}; module_index++)); do
+        [ "${MODULE_ORDER[$module_index]}" = "$focused_value" ] && break
+      done
       marker=" "
-      [ "${selected[$index]}" -eq 1 ] && marker="x"
+      [ "${selected[$module_index]}" -eq 1 ] && marker="x"
 
       if [ "$index" -eq "$current" ]; then
-        printf '\033[2K\r\033[7m> [%s] %-28s %s\033[0m\n' \
-          "$marker" "$module" "$(module_description "$module")" >&3
+        printf '\033[2K\r\033[7m>   [%s] %-28s %s\033[0m\n' \
+          "$marker" "$focused_value" "$(module_description "$focused_value")" >&3
       else
-        printf '\033[2K\r  [%s] %-28s %s\n' \
-          "$marker" "$module" "$(module_description "$module")" >&3
+        printf '\033[2K\r    [%s] %-28s %s\n' \
+          "$marker" "$focused_value" "$(module_description "$focused_value")" >&3
       fi
     done
 
     printf '\033[2K\r%s\n' "$message" >&3
     rendered=1
+    menu_line_count=$((${#visible_values[@]} + 5))
     message=""
     key=""
 
@@ -616,8 +703,9 @@ select_modules_interactively() {
         IFS= read -rsn2 -t 0.1 escape_sequence <&3 || true
         case "$escape_sequence" in
           '[A')
+            last_visible_index=$((${#visible_values[@]} - 1))
             if [ "$current" -eq -1 ]; then
-              current=$((${#MODULE_ORDER[@]} - 1))
+              current=$last_visible_index
             elif [ "$current" -eq 0 ]; then
               current=-1
             else
@@ -625,17 +713,33 @@ select_modules_interactively() {
             fi
             ;;
           '[B')
+            last_visible_index=$((${#visible_values[@]} - 1))
             if [ "$current" -eq -1 ]; then
               current=0
-            elif [ "$current" -eq $((${#MODULE_ORDER[@]} - 1)) ]; then
+            elif [ "$current" -eq "$last_visible_index" ]; then
               current=-1
             else
               current=$((current + 1))
             fi
             ;;
+          '[C'|'[D')
+            if [ "$current" -ge 0 ] && [ "${visible_types[$current]}" = category ]; then
+              focused_value="${visible_values[$current]}"
+              for ((category_index = 0; category_index < ${#CATEGORY_ORDER[@]}; category_index++)); do
+                if [ "${CATEGORY_ORDER[$category_index]}" = "$focused_value" ]; then
+                  if [ "$escape_sequence" = '[C' ]; then
+                    expanded[$category_index]=1
+                  else
+                    expanded[$category_index]=0
+                  fi
+                  break
+                fi
+              done
+            fi
+            ;;
         esac
         ;;
-      ' '| '')
+      ' ')
         if [ "$current" -eq -1 ]; then
           for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
             selected[index]=0
@@ -644,14 +748,48 @@ select_modules_interactively() {
           continue
         fi
 
-        if [ "$key" = ' ' ]; then
-          if [ "${selected[$current]}" -eq 1 ]; then
-            selected[current]=0
-          else
-            selected[current]=1
-          fi
-          continue
+        focused_type="${visible_types[$current]}"
+        focused_value="${visible_values[$current]}"
+        if [ "$focused_type" = category ]; then
+          category_child_count=0
+          category_selected_count=0
+          for module in $(category_modules "$focused_value"); do
+            category_child_count=$((category_child_count + 1))
+            for ((module_index = 0; module_index < ${#MODULE_ORDER[@]}; module_index++)); do
+              if [ "${MODULE_ORDER[$module_index]}" = "$module" ]; then
+                category_selected_count=$((category_selected_count + selected[$module_index]))
+                break
+              fi
+            done
+          done
+          for module in $(category_modules "$focused_value"); do
+            for ((module_index = 0; module_index < ${#MODULE_ORDER[@]}; module_index++)); do
+              if [ "${MODULE_ORDER[$module_index]}" = "$module" ]; then
+                if [ "$category_selected_count" -eq "$category_child_count" ]; then
+                  selected[$module_index]=0
+                else
+                  selected[$module_index]=1
+                fi
+                break
+              fi
+            done
+          done
+        else
+          for ((module_index = 0; module_index < ${#MODULE_ORDER[@]}; module_index++)); do
+            if [ "${MODULE_ORDER[$module_index]}" = "$focused_value" ]; then
+              if [ "${selected[$module_index]}" -eq 1 ]; then
+                selected[$module_index]=0
+              else
+                selected[$module_index]=1
+              fi
+              break
+            fi
+          done
         fi
+        continue
+
+        ;;
+      ''|$'\r')
 
         selected_count=0
         INTERACTIVE_SELECTED_MODULES=""
