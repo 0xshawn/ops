@@ -24,7 +24,9 @@ TARGET_GROUP=""
 INTERACTIVE_SELECTED_MODULES=""
 INTERACTIVE_MENU_TTY_OPEN=0
 TASK_LOG_FILE=""
+TASK_COMMAND_PID=""
 TASK_SPINNER_PID=""
+TASK_STATE_FILE=""
 
 die() {
   echo "$1" >&2
@@ -35,7 +37,26 @@ log_step() {
   printf '\n==> %s\n' "$1"
 }
 
+terminate_task_process_tree() {
+  local child
+  local children=""
+  local pid="$1"
+
+  if [ -r "/proc/$pid/task/$pid/children" ]; then
+    IFS= read -r children <"/proc/$pid/task/$pid/children" || true
+  fi
+  for child in $children; do
+    terminate_task_process_tree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
 cleanup_task_status() {
+  if [ -n "$TASK_COMMAND_PID" ]; then
+    terminate_task_process_tree "$TASK_COMMAND_PID"
+    wait "$TASK_COMMAND_PID" 2>/dev/null || true
+  fi
+
   if [ -n "$TASK_SPINNER_PID" ]; then
     if kill -0 "$TASK_SPINNER_PID" 2>/dev/null; then
       kill "$TASK_SPINNER_PID" 2>/dev/null || true
@@ -50,9 +71,14 @@ cleanup_task_status() {
   if [ -n "$TASK_LOG_FILE" ]; then
     rm -f "$TASK_LOG_FILE"
   fi
+  if [ -n "$TASK_STATE_FILE" ]; then
+    rm -f "$TASK_STATE_FILE"
+  fi
 
+  TASK_COMMAND_PID=""
   TASK_LOG_FILE=""
   TASK_SPINNER_PID=""
+  TASK_STATE_FILE=""
 }
 
 handle_task_signal() {
@@ -78,8 +104,15 @@ render_spinner() {
 run_task() {
   local description="$1"
   local status
+  local task_state=()
   shift
   TASK_LOG_FILE="$(mktemp)" || return
+  TASK_STATE_FILE="$(mktemp)" || {
+    status=$?
+    rm -f "$TASK_LOG_FILE"
+    TASK_LOG_FILE=""
+    return "$status"
+  }
 
   if [ -t 1 ]; then
     printf '\033[?25l'
@@ -89,10 +122,28 @@ run_task() {
     printf 'START %s\n' "$description"
   fi
 
-  if "$@" >"$TASK_LOG_FILE" 2>&1; then
+  (
+    if "$@"; then
+      printf '%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP" >"$TASK_STATE_FILE"
+      exit 0
+    else
+      exit "$?"
+    fi
+  ) >"$TASK_LOG_FILE" 2>&1 &
+  TASK_COMMAND_PID=$!
+
+  if wait "$TASK_COMMAND_PID"; then
     status=0
   else
     status=$?
+  fi
+  TASK_COMMAND_PID=""
+
+  if [ "$status" -eq 0 ]; then
+    mapfile -t task_state <"$TASK_STATE_FILE"
+    TARGET_USER="${task_state[0]:-}"
+    TARGET_HOME="${task_state[1]:-}"
+    TARGET_GROUP="${task_state[2]:-}"
   fi
 
   if [ -n "$TASK_SPINNER_PID" ]; then

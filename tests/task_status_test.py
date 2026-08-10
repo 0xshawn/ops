@@ -37,19 +37,30 @@ def run_driver(command: str) -> subprocess.CompletedProcess[str]:
         )
 
 
-def run_signaled_task_driver(directory: Path) -> tuple[int, bytes, Path]:
+def run_signaled_task_driver(
+    directory: Path, task_signal: signal.Signals
+) -> tuple[int, bytes, Path, int]:
     driver = directory / "signaled_task_driver.sh"
     log_record = directory / "task-log-path"
+    external_pid_record = directory / "external-pid"
+    long_command = directory / "long-command.sh"
+    long_command.write_text(
+        "#!/bin/bash\n"
+        "printf '%s\\n' \"$$\" >\"$EXTERNAL_PID_RECORD\"\n"
+        "exec /bin/sleep 30\n"
+    )
+    long_command.chmod(0o755)
     driver.write_text(
         script_definitions()
         + f"""
 export LOG_RECORD={log_record}
+export EXTERNAL_PID_RECORD={external_pid_record}
 require_supported_os() {{ :; }}
 init_target_user() {{ :; }}
 require_sudo() {{ :; }}
 install_common_tools() {{
   printf '%s\n' "$TASK_LOG_FILE" >"$LOG_RECORD"
-  while :; do :; done
+  {long_command}
 }}
 main install_common_tools
 """
@@ -63,9 +74,40 @@ main install_common_tools
 
     output = bytearray()
     signal_sent = False
+    wait_status = None
     deadline = time.monotonic() + 5
     try:
         while time.monotonic() < deadline:
+            readable, _, _ = select.select([fd], [], [], 0.05)
+            if readable:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    chunk = b""
+                output.extend(chunk)
+            if (
+                not signal_sent
+                and b"Installing common tools" in output
+                and log_record.exists()
+                and external_pid_record.exists()
+            ):
+                os.kill(pid, task_signal)
+                signal_sent = True
+            if signal_sent:
+                finished_pid, candidate_status = os.waitpid(pid, os.WNOHANG)
+                if finished_pid == pid:
+                    wait_status = candidate_status
+                    break
+        else:
+            os.kill(pid, signal.SIGKILL)
+            if external_pid_record.exists():
+                os.kill(int(external_pid_record.read_text()), signal.SIGKILL)
+            raise AssertionError(f"Task process did not terminate:\n{output!r}")
+
+        drain_deadline = time.monotonic() + 0.3
+        while time.monotonic() < drain_deadline:
             readable, _, _ = select.select([fd], [], [], 0.05)
             if not readable:
                 continue
@@ -78,12 +120,6 @@ main install_common_tools
             if not chunk:
                 break
             output.extend(chunk)
-            if not signal_sent and b"Installing common tools" in output:
-                os.kill(pid, signal.SIGTERM)
-                signal_sent = True
-        else:
-            os.kill(pid, signal.SIGKILL)
-            raise AssertionError(f"Task process did not terminate:\n{output!r}")
     finally:
         os.close(fd)
 
@@ -92,8 +128,10 @@ main install_common_tools
         os.waitpid(pid, 0)
         raise AssertionError(f"Task spinner was not rendered:\n{output!r}")
 
-    _, wait_status = os.waitpid(pid, 0)
-    return os.waitstatus_to_exitcode(wait_status), bytes(output), log_record
+    if wait_status is None:
+        _, wait_status = os.waitpid(pid, 0)
+    external_pid = int(external_pid_record.read_text())
+    return os.waitstatus_to_exitcode(wait_status), bytes(output), log_record, external_pid
 
 
 class TaskStatusTest(unittest.TestCase):
@@ -189,17 +227,23 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("TARGET:test-user:/tmp:test-group", result.stdout)
 
-    def test_task_signal_restores_tty_and_removes_log(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            status, output, log_record = run_signaled_task_driver(
-                Path(temporary_directory)
-            )
-            self.assertTrue(log_record.exists(), output)
-            task_log = Path(log_record.read_text().strip())
-            self.assertEqual(status, 130, output)
-            self.assertIn(b"\x1b[?25l", output)
-            self.assertIn(b"\x1b[?25h", output)
-            self.assertFalse(task_log.exists(), output)
+    def test_task_signals_stop_external_command_and_cleanup(self):
+        for task_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(task_signal=task_signal):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    status, output, log_record, external_pid = run_signaled_task_driver(
+                        Path(temporary_directory), task_signal
+                    )
+                    self.assertTrue(log_record.exists(), output)
+                    task_log = Path(log_record.read_text().strip())
+                    self.assertEqual(status, 130, output)
+                    self.assertIn(b"\x1b[?25l", output)
+                    self.assertIn(b"\x1b[?25h", output)
+                    self.assertFalse(task_log.exists(), output)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(external_pid, 0)
+                    after_restore = output.rsplit(b"\x1b[?25h", 1)[-1]
+                    self.assertNotIn(b"Installing common tools", after_restore)
 
     def test_die_stops_task_before_later_commands(self):
         result = run_driver(
@@ -215,15 +259,18 @@ wget() { printf '#!/usr/bin/env bash\\nexit 0\\n'; }
 run_as_root() {
   case "$1" in
     bash) "$@" ;;
-    systemctl) systemctl_ran=1 ;;
+    systemctl) printf 'ran\\n' >"$SYSTEMCTL_FILE" ;;
   esac
 }
-systemctl_ran=0
+SYSTEMCTL_FILE="$(mktemp)"
 if run_task 'Installing Docker' install_docker; then
   status=0
 else
   status=$?
 fi
+systemctl_ran=0
+[ ! -s "$SYSTEMCTL_FILE" ] || systemctl_ran=1
+rm -f "$SYSTEMCTL_FILE"
 printf 'STATUS:%s\\nSYSTEMCTL:%s\\n' "$status" "$systemctl_ran"
 """
         )
