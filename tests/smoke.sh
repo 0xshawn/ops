@@ -9,14 +9,14 @@ SCRIPTS=(
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-UBUNTU_22_04_OS_RELEASE="$TMP_DIR/ubuntu-22.04-os-release"
+UBUNTU_20_04_OS_RELEASE="$TMP_DIR/ubuntu-20.04-os-release"
 UBUNTU_24_04_OS_RELEASE="$TMP_DIR/ubuntu-24.04-os-release"
 UBUNTU_24_10_OS_RELEASE="$TMP_DIR/ubuntu-24.10-os-release"
 DEBIAN_12_OS_RELEASE="$TMP_DIR/debian-12-os-release"
 
-cat >"$UBUNTU_22_04_OS_RELEASE" <<'EOL'
+cat >"$UBUNTU_20_04_OS_RELEASE" <<'EOL'
 ID=ubuntu
-VERSION_ID="22.04"
+VERSION_ID="20.04"
 EOL
 
 cat >"$UBUNTU_24_04_OS_RELEASE" <<'EOL'
@@ -71,7 +71,7 @@ unsupported_os_fails_before_root_check() {
   status=$?
 
   [ "$status" -eq 1 ] &&
-    grep -q "Error: This script is only supported on Ubuntu >= 24.04." <<<"$output" &&
+    grep -q "Error: This script is only supported on Ubuntu >= 22.04." <<<"$output" &&
     ! grep -q "Use Up/Down" <<<"$output" &&
     ! grep -q "Please run as root" <<<"$output"
 }
@@ -285,7 +285,7 @@ for script in "${SCRIPTS[@]}"; do
 done
 
 check "repository has one top-level script" has_single_top_level_script
-check "Ubuntu 22.04 is rejected before root check" unsupported_os_fails_before_root_check "$UBUNTU_22_04_OS_RELEASE"
+check "Ubuntu 20.04 is rejected before root check" unsupported_os_fails_before_root_check "$UBUNTU_20_04_OS_RELEASE"
 check "Debian 12 is rejected before root check" unsupported_os_fails_before_root_check "$DEBIAN_12_OS_RELEASE"
 check "script supports normal user entrypoint" supports_normal_user_entrypoint
 check "system changes use sudo helper" system_changes_use_sudo_helper

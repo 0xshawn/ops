@@ -1,6 +1,6 @@
 # ops
 
-Ubuntu server initialization script for Ubuntu 24.04 and newer.
+Ubuntu server initialization script for Ubuntu 22.04 and newer.
 
 ## Remote execution
 
@@ -10,7 +10,7 @@ Run the initializer directly from GitHub:
 curl -fsSL https://raw.githubusercontent.com/0xshawn/ops/main/ubuntu_init.sh | bash
 ```
 
-The script uses sudo for system changes and exits on non-Ubuntu systems or Ubuntu versions older than 24.04.
+The script uses sudo for system changes and exits on non-Ubuntu systems or Ubuntu versions older than 22.04.
 
 ## Interactive selection
 

@@ -570,7 +570,7 @@ run_task() {
 }
 
 unsupported_os() {
-  die "Error: This script is only supported on Ubuntu >= 24.04."
+  die "Error: This script is only supported on Ubuntu >= 22.04."
 }
 
 is_root() {
