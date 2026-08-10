@@ -123,16 +123,20 @@ require_sudo() {
     return 0
   fi
 
-  command -v "$SUDO_BIN" >/dev/null 2>&1 ||
+  command -v "$SUDO_BIN" >/dev/null 2>&1 || {
     die "This script requires sudo."
+    return 1
+  }
 
   if "$SUDO_BIN" -n true 2>/dev/null; then
     return 0
   fi
 
   if [ -r /dev/tty ]; then
-    "$SUDO_BIN" -v </dev/tty ||
+    "$SUDO_BIN" -v </dev/tty || {
       die "This script requires sudo privileges."
+      return 1
+    }
     return 0
   fi
 
@@ -159,8 +163,10 @@ run_as_target_user() {
   fi
 
   if is_root; then
-    command -v runuser >/dev/null 2>&1 ||
+    command -v runuser >/dev/null 2>&1 || {
       die "This script requires runuser to switch to $TARGET_USER."
+      return 1
+    }
     runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" SHELL="$target_shell" "$@"
     return
   fi
@@ -241,13 +247,22 @@ require_supported_os() {
   local os_id
   local version_id
 
-  [ -r "$OS_RELEASE_PATH" ] || unsupported_os
+  [ -r "$OS_RELEASE_PATH" ] || {
+    unsupported_os
+    return 1
+  }
 
   os_id="$(read_os_release_value ID "$OS_RELEASE_PATH" || true)"
   version_id="$(read_os_release_value VERSION_ID "$OS_RELEASE_PATH" || true)"
 
-  [ "$os_id" = "ubuntu" ] || unsupported_os
-  version_at_least_minimum "$version_id" || unsupported_os
+  [ "$os_id" = "ubuntu" ] || {
+    unsupported_os
+    return 1
+  }
+  version_at_least_minimum "$version_id" || {
+    unsupported_os
+    return 1
+  }
 }
 
 init_target_user() {
@@ -350,8 +365,10 @@ install_docker() {
     wget -qO- get.docker.com | run_as_root bash
   fi
 
-  command -v docker >/dev/null 2>&1 ||
+  command -v docker >/dev/null 2>&1 || {
     die "Docker installation completed without installing the docker command."
+    return 1
+  }
 
   run_as_root systemctl enable docker
   run_as_root systemctl restart docker
@@ -666,10 +683,13 @@ main() {
         ;;
       -*)
         die "Unknown option: $1 (use --help for usage)"
+        return 1
         ;;
       *)
-        is_known_module "$1" ||
+        is_known_module "$1" || {
           die "Unknown module: $1 (use --list to see available modules)"
+          return 1
+        }
         selected_modules="$selected_modules $1"
         run_all=0
         ;;
@@ -678,7 +698,10 @@ main() {
   done
 
   if [ "$original_arg_count" -eq 0 ] && has_controlling_terminal; then
-    select_modules_interactively || die "Unable to read the interactive selection."
+    select_modules_interactively || {
+      die "Unable to read the interactive selection."
+      return 1
+    }
     selected_modules="$INTERACTIVE_SELECTED_MODULES"
     run_all=0
   fi

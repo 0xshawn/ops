@@ -54,6 +54,41 @@ class TaskStatusTest(unittest.TestCase):
         self.assertIn("FAILED Failed task", result.stdout)
         self.assertIn("failure-detail", result.stdout)
 
+    def test_die_stops_task_before_later_commands(self):
+        result = run_driver(
+            """
+is_root() { return 0; }
+command() {
+  if [ "$1" = "-v" ] && [ "${2:-}" = "docker" ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+wget() { printf '#!/usr/bin/env bash\\nexit 0\\n'; }
+run_as_root() {
+  case "$1" in
+    bash) "$@" ;;
+    systemctl) systemctl_ran=1 ;;
+  esac
+}
+systemctl_ran=0
+if run_task 'Installing Docker' install_docker; then
+  status=0
+else
+  status=$?
+fi
+printf 'STATUS:%s\\nSYSTEMCTL:%s\\n' "$status" "$systemctl_ran"
+"""
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("FAILED Installing Docker", result.stdout)
+        self.assertIn(
+            "Docker installation completed without installing the docker command.",
+            result.stdout,
+        )
+        self.assertIn("STATUS:1", result.stdout)
+        self.assertIn("SYSTEMCTL:0", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
