@@ -16,20 +16,98 @@ readonly MIN_UBUNTU_MINOR=4
 readonly DOCKER_DATA_ROOT="/data/docker"
 readonly OS_RELEASE_PATH="${OS_RELEASE_FILE:-/etc/os-release}"
 readonly SUDO_BIN="${SUDO_BIN:-sudo}"
+readonly TASK_SKIPPED=20
 
 TARGET_USER=""
 TARGET_HOME=""
 TARGET_GROUP=""
 INTERACTIVE_SELECTED_MODULES=""
 INTERACTIVE_MENU_TTY_OPEN=0
+TASK_LOG_FILE=""
+TASK_SPINNER_PID=""
 
 die() {
   echo "$1" >&2
-  exit 1
+  return 1
 }
 
 log_step() {
   printf '\n==> %s\n' "$1"
+}
+
+cleanup_task_status() {
+  if [ -n "$TASK_SPINNER_PID" ]; then
+    if kill -0 "$TASK_SPINNER_PID" 2>/dev/null; then
+      kill "$TASK_SPINNER_PID" 2>/dev/null || true
+    fi
+    wait "$TASK_SPINNER_PID" 2>/dev/null || true
+  fi
+
+  [ -t 1 ] && printf '\033[?25h'
+
+  if [ -n "$TASK_LOG_FILE" ]; then
+    rm -f "$TASK_LOG_FILE"
+  fi
+
+  TASK_LOG_FILE=""
+  TASK_SPINNER_PID=""
+}
+
+render_spinner() {
+  local description="$1"
+  local frame
+  local frames=( '|' '/' '-' '\\' )
+  local index=0
+
+  while true; do
+    frame="${frames[$index]}"
+    printf '\r%s %s' "$frame" "$description"
+    index=$(((index + 1) % ${#frames[@]}))
+    sleep 0.1
+  done
+}
+
+run_task() {
+  local description="$1"
+  local status
+  shift
+  TASK_LOG_FILE="$(mktemp)"
+
+  if [ -t 1 ]; then
+    printf '\033[?25l'
+    render_spinner "$description" &
+    TASK_SPINNER_PID=$!
+  else
+    printf 'START %s\n' "$description"
+  fi
+
+  set +e
+  "$@" >"$TASK_LOG_FILE" 2>&1
+  status=$?
+  set -e
+
+  if [ -n "$TASK_SPINNER_PID" ]; then
+    kill "$TASK_SPINNER_PID" 2>/dev/null || true
+    wait "$TASK_SPINNER_PID" 2>/dev/null || true
+    TASK_SPINNER_PID=""
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    [ -t 1 ] && printf '\r\033[2K✓ %s\n' "$description" || printf 'OK %s\n' "$description"
+    cleanup_task_status
+    return 0
+  fi
+
+  if [ "$status" -eq "$TASK_SKIPPED" ]; then
+    [ -t 1 ] && printf '\r\033[2K- %s (skipped)\n' "$description" || printf 'SKIPPED %s\n' "$description"
+    cleanup_task_status
+    return 0
+  fi
+
+  [ -t 1 ] && printf '\r\033[2K✗ %s\n' "$description" || printf 'FAILED %s\n' "$description"
+  cat "$TASK_LOG_FILE"
+  cleanup_task_status
+  return "$status"
 }
 
 unsupported_os() {
@@ -412,8 +490,8 @@ select_modules_interactively() {
 
   exec 3<>/dev/tty 2>/dev/null || return 1
   INTERACTIVE_MENU_TTY_OPEN=1
-  trap 'cleanup_interactive_menu' EXIT
-  trap 'cleanup_interactive_menu; exit 130' INT TERM HUP
+  trap 'cleanup_interactive_menu; cleanup_task_status' EXIT
+  trap 'cleanup_interactive_menu; cleanup_task_status; exit 130' INT TERM HUP
 
   for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
     selected[index]=1
@@ -555,8 +633,7 @@ EOF
 
 run_module() {
   local module="$1"
-  log_step "$(module_description "$module")"
-  "$module"
+  run_task "$(module_description "$module")" "$module"
 }
 
 is_selected_module() {
@@ -606,12 +683,9 @@ main() {
     run_all=0
   fi
 
-  log_step "Checking operating system"
-  require_supported_os
-  log_step "Resolving target user"
-  init_target_user
-  log_step "Checking sudo privileges"
-  require_sudo
+  run_task "Checking operating system" require_supported_os
+  run_task "Resolving target user" init_target_user
+  run_task "Checking sudo privileges" require_sudo
 
   local module
   for module in "${MODULE_ORDER[@]}"; do
