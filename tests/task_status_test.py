@@ -41,13 +41,42 @@ def run_signaled_task_driver(
     directory: Path,
     task_signal: signal.Signals,
     *,
+    repeat_signal: bool = False,
     term_resistant_descendant: bool = False,
-) -> tuple[int, bytes, Path, int]:
+    term_resistant_tree_depth: int = 0,
+) -> tuple[int, bytes, Path, list[int], float]:
     driver = directory / "signaled_task_driver.sh"
     log_record = directory / "task-log-path"
     external_pid_record = directory / "external-pid"
     long_command = directory / "long-command.sh"
-    if term_resistant_descendant:
+    expected_pid_count = 1
+    if term_resistant_tree_depth:
+        expected_pid_count = term_resistant_tree_depth * 2 + 1
+        resistant_command = directory / "term-resistant-tree.py"
+        resistant_command.write_text(
+            "import os\n"
+            "import signal\n"
+            "import subprocess\n"
+            "import sys\n"
+            "\n"
+            "pid_file = sys.argv[1]\n"
+            "depth = int(sys.argv[2])\n"
+            "for task_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+            "    signal.signal(task_signal, signal.SIG_IGN)\n"
+            "with open(pid_file, 'a') as record:\n"
+            "    record.write(f'{os.getpid()}\\n')\n"
+            "if depth:\n"
+            "    subprocess.Popen([sys.executable, __file__, pid_file, '0'])\n"
+            "    subprocess.Popen([sys.executable, __file__, pid_file, str(depth - 1)])\n"
+            "while True:\n"
+            "    signal.pause()\n"
+        )
+        long_command.write_text(
+            "#!/bin/bash\n"
+            f"exec python3 {resistant_command} \"$EXTERNAL_PID_RECORD\" "
+            f"{term_resistant_tree_depth}\n"
+        )
+    elif term_resistant_descendant:
         resistant_command = directory / "term-resistant-command.py"
         resistant_command.write_text(
             "import os\n"
@@ -96,8 +125,23 @@ main install_common_tools
 
     output = bytearray()
     signal_sent = False
+    signal_sent_at = None
+    repeated_signal_sent = False
     wait_status = None
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 7
+
+    def recorded_pids() -> list[int]:
+        if not external_pid_record.exists():
+            return []
+        return [int(value) for value in external_pid_record.read_text().split()]
+
+    def kill_recorded_pids() -> None:
+        for recorded_pid in recorded_pids():
+            try:
+                os.kill(recorded_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     try:
         while time.monotonic() < deadline:
             readable, _, _ = select.select([fd], [], [], 0.05)
@@ -113,10 +157,23 @@ main install_common_tools
                 not signal_sent
                 and b"Installing common tools" in output
                 and log_record.exists()
-                and external_pid_record.exists()
+                and len(recorded_pids()) >= expected_pid_count
             ):
                 os.kill(pid, task_signal)
                 signal_sent = True
+                signal_sent_at = time.monotonic()
+            if (
+                repeat_signal
+                and signal_sent
+                and not repeated_signal_sent
+                and signal_sent_at is not None
+                and time.monotonic() - signal_sent_at >= 0.1
+            ):
+                try:
+                    os.kill(pid, task_signal)
+                except ProcessLookupError:
+                    pass
+                repeated_signal_sent = True
             if signal_sent:
                 finished_pid, candidate_status = os.waitpid(pid, os.WNOHANG)
                 if finished_pid == pid:
@@ -124,8 +181,8 @@ main install_common_tools
                     break
         else:
             os.kill(pid, signal.SIGKILL)
-            if external_pid_record.exists():
-                os.kill(int(external_pid_record.read_text()), signal.SIGKILL)
+            kill_recorded_pids()
+            os.waitpid(pid, 0)
             raise AssertionError(f"Task process did not terminate:\n{output!r}")
 
         drain_deadline = time.monotonic() + 0.3
@@ -152,8 +209,15 @@ main install_common_tools
 
     if wait_status is None:
         _, wait_status = os.waitpid(pid, 0)
-    external_pid = int(external_pid_record.read_text())
-    return os.waitstatus_to_exitcode(wait_status), bytes(output), log_record, external_pid
+    external_pids = recorded_pids()
+    assert signal_sent_at is not None
+    return (
+        os.waitstatus_to_exitcode(wait_status),
+        bytes(output),
+        log_record,
+        external_pids,
+        time.monotonic() - signal_sent_at,
+    )
 
 
 class TaskStatusTest(unittest.TestCase):
@@ -258,9 +322,10 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
         for task_signal, expected_status in expected_statuses.items():
             with self.subTest(task_signal=task_signal):
                 with tempfile.TemporaryDirectory() as temporary_directory:
-                    status, output, log_record, external_pid = run_signaled_task_driver(
+                    status, output, log_record, external_pids, _ = run_signaled_task_driver(
                         Path(temporary_directory), task_signal
                     )
+                    external_pid = external_pids[0]
                     self.assertTrue(log_record.exists(), output)
                     task_log = Path(log_record.read_text().strip())
                     self.assertEqual(status, expected_status, output)
@@ -274,11 +339,12 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
 
     def test_task_signal_kills_term_resistant_descendant_before_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            status, output, log_record, external_pid = run_signaled_task_driver(
+            status, output, log_record, external_pids, _ = run_signaled_task_driver(
                 Path(temporary_directory),
                 signal.SIGTERM,
                 term_resistant_descendant=True,
             )
+            external_pid = external_pids[0]
             self.assertTrue(log_record.exists(), output)
             task_log = Path(log_record.read_text().strip())
             try:
@@ -291,6 +357,129 @@ printf 'TARGET:%s:%s:%s\n' "$TARGET_USER" "$TARGET_HOME" "$TARGET_GROUP"
                     os.kill(external_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def test_repeated_signal_does_not_interrupt_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            external_pids: list[int] = []
+            try:
+                status, output, log_record, external_pids, _ = run_signaled_task_driver(
+                    Path(temporary_directory),
+                    signal.SIGTERM,
+                    repeat_signal=True,
+                    term_resistant_descendant=True,
+                )
+                self.assertEqual(status, 143, output)
+                self.assertIn(b"\x1b[?25h", output)
+                self.assertFalse(Path(log_record.read_text().strip()).exists(), output)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(external_pids[0], 0)
+            finally:
+                for external_pid in external_pids:
+                    try:
+                        os.kill(external_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_task_shutdown_uses_one_deadline_for_many_deep_processes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            external_pids: list[int] = []
+            try:
+                status, output, log_record, external_pids, elapsed = (
+                    run_signaled_task_driver(
+                        Path(temporary_directory),
+                        signal.SIGTERM,
+                        term_resistant_tree_depth=12,
+                    )
+                )
+                self.assertEqual(status, 143, output)
+                self.assertEqual(len(external_pids), 25)
+                self.assertLess(elapsed, 4.5, output)
+                self.assertFalse(Path(log_record.read_text().strip()).exists(), output)
+
+                remaining = list(external_pids)
+                reap_deadline = time.monotonic() + 1
+                while remaining and time.monotonic() < reap_deadline:
+                    survivors = []
+                    for external_pid in remaining:
+                        try:
+                            os.kill(external_pid, 0)
+                            survivors.append(external_pid)
+                        except ProcessLookupError:
+                            pass
+                    remaining = survivors
+                    time.sleep(0.02)
+                self.assertEqual(remaining, [], output)
+            finally:
+                for external_pid in external_pids:
+                    try:
+                        os.kill(external_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_inspection_failure_is_retained_as_unverified_cleanup(self):
+        result = run_driver(
+            """
+inspection_attempted=0
+mock_time=0
+task_time_milliseconds() {
+  TASK_NOW_MILLISECONDS="$mock_time"
+  mock_time=$((mock_time + 100))
+}
+task_process_details() {
+  if [ "$inspection_attempted" -eq 1 ]; then
+    return "$TASK_PROCESS_GONE"
+  fi
+  TASK_PROCESS_START=456
+  TASK_PROCESS_STATE=S
+}
+task_process_children() {
+  TASK_PROCESS_CHILDREN=()
+  inspection_attempted=1
+  return "$TASK_PROCESS_UNINSPECTABLE"
+}
+signal_task_process() { :; }
+sleep() { :; }
+if terminate_task_process_tree 123 456; then
+  status=0
+else
+  status=$?
+fi
+printf 'STATUS:%s\n' "$status"
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("STATUS:1", result.stdout)
+        self.assertIn("unable to verify stopped task process 123", result.stdout)
+
+    def test_uninspectable_process_metadata_is_not_treated_as_gone(self):
+        result = run_driver(
+            """
+task_process_details() { return "$TASK_PROCESS_UNINSPECTABLE"; }
+if terminate_task_process_tree 123 456; then
+  status=0
+else
+  status=$?
+fi
+printf 'STATUS:%s\n' "$status"
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("STATUS:1", result.stdout)
+        self.assertIn("unable to verify stopped task process 123", result.stdout)
+
+    def test_cleanup_does_not_wait_after_unverified_shutdown(self):
+        result = run_driver(
+            """
+TASK_COMMAND_PID=123
+terminate_task_process_tree() { return 1; }
+wait() { printf 'UNBOUNDED-WAIT\n'; }
+cleanup_task_status
+printf 'CLEANED\n'
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("CLEANED", result.stdout)
+        self.assertNotIn("UNBOUNDED-WAIT", result.stdout)
 
     def test_die_stops_task_before_later_commands(self):
         result = run_driver(

@@ -16,9 +16,12 @@ readonly MIN_UBUNTU_MINOR=4
 readonly DOCKER_DATA_ROOT="/data/docker"
 readonly OS_RELEASE_PATH="${OS_RELEASE_FILE:-/etc/os-release}"
 readonly SUDO_BIN="${SUDO_BIN:-sudo}"
+readonly TASK_PROCESS_GONE=1
+readonly TASK_PROCESS_UNINSPECTABLE=2
 readonly TASK_SKIPPED=20
-readonly TASK_TERMINATION_GRACE_ATTEMPTS=20
-readonly TASK_TERMINATION_KILL_ATTEMPTS=40
+readonly TASK_TERMINATION_GRACE_MILLISECONDS=1000
+readonly TASK_TERMINATION_TIMEOUT_MILLISECONDS=3000
+readonly TASK_TERMINATION_POLL_SECONDS=0.05
 
 TARGET_USER=""
 TARGET_HOME=""
@@ -29,6 +32,17 @@ TASK_LOG_FILE=""
 TASK_COMMAND_PID=""
 TASK_SPINNER_PID=""
 TASK_STATE_FILE=""
+TASK_CLEANUP_ACTIVE=0
+TASK_PENDING_SIGNAL_STATUS=""
+TASK_PROCESS_START=""
+TASK_PROCESS_STATE=""
+TASK_PROCESS_CHILDREN=()
+TASK_NOW_MILLISECONDS=0
+TASK_PROCESS_SCAN_EXPIRED=0
+TASK_PROCESS_VERIFICATION_FAILED=0
+TASK_ALL_TRACKED_PROCESSES_STOPPED=0
+TASK_TRACKED_PROCESS_IDENTITIES=()
+declare -A TASK_TRACKED_PROCESS_SEEN=()
 
 die() {
   echo "$1" >&2
@@ -42,143 +56,390 @@ log_step() {
 task_process_details() {
   local details=()
   local pid="$1"
+  local presence
   local stat
+  local stat_fd
+  local stat_path="/proc/$pid/stat"
 
-  if ! IFS= read -r stat <"/proc/$pid/stat" 2>/dev/null; then
-    if is_root || ! command -v "$SUDO_BIN" >/dev/null 2>&1; then
-      return 1
+  TASK_PROCESS_START=""
+  TASK_PROCESS_STATE=""
+  stat=""
+  if { exec {stat_fd}<"$stat_path"; } 2>/dev/null; then
+    IFS= read -r -d '' stat <&"$stat_fd" || true
+    exec {stat_fd}<&-
+  elif is_root; then
+    [ ! -e "$stat_path" ] && return "$TASK_PROCESS_GONE"
+    return "$TASK_PROCESS_UNINSPECTABLE"
+  elif command -v "$SUDO_BIN" >/dev/null 2>&1; then
+    if ! stat="$("$SUDO_BIN" -n /bin/cat "$stat_path" 2>/dev/null)"; then
+      if ! presence="$("$SUDO_BIN" -n /bin/sh -c '
+        if [ -e "$1" ]; then
+          printf present
+        else
+          printf gone
+        fi
+      ' sh "$stat_path" 2>/dev/null)"; then
+        return "$TASK_PROCESS_UNINSPECTABLE"
+      fi
+      [ "$presence" = gone ] && return "$TASK_PROCESS_GONE"
+      return "$TASK_PROCESS_UNINSPECTABLE"
     fi
-    stat="$("$SUDO_BIN" -n cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+  else
+    return "$TASK_PROCESS_UNINSPECTABLE"
   fi
+
+  [ "${stat##*) }" != "$stat" ] || return "$TASK_PROCESS_UNINSPECTABLE"
   read -r -a details <<<"${stat##*) }"
-  [ "${#details[@]}" -ge 20 ] || return 1
-  printf '%s %s\n' "${details[19]}" "${details[0]}"
-}
-
-task_process_matches() {
-  local current_start
-  local expected_start="$2"
-  local pid="$1"
-  local state
-
-  read -r current_start state < <(task_process_details "$pid") || return 1
-  [ "$current_start" = "$expected_start" ]
+  [ "${#details[@]}" -ge 20 ] || return "$TASK_PROCESS_UNINSPECTABLE"
+  [[ "${details[19]}" =~ ^[0-9]+$ ]] || return "$TASK_PROCESS_UNINSPECTABLE"
+  [[ "${details[0]}" =~ ^[A-Za-z]$ ]] || return "$TASK_PROCESS_UNINSPECTABLE"
+  TASK_PROCESS_START="${details[19]}"
+  TASK_PROCESS_STATE="${details[0]}"
 }
 
 task_process_children() {
   local child
   local child_file
+  local -a child_files=()
   local children=""
-  local inspected=0
+  local deadline="$3"
+  local expected_start="$2"
+  local found=0
   local pid="$1"
+  local status
   local -A seen=()
 
-  for child_file in "/proc/$pid"/task/*/children; do
+  TASK_PROCESS_CHILDREN=()
+  if task_process_details "$pid"; then
+    :
+  else
+    return "$?"
+  fi
+  [ "$TASK_PROCESS_START" = "$expected_start" ] || return "$TASK_PROCESS_GONE"
+  case "$TASK_PROCESS_STATE" in
+    Z|X) return "$TASK_PROCESS_GONE" ;;
+  esac
+
+  child_files=( "/proc/$pid"/task/*/children )
+  for child_file in "${child_files[@]}"; do
+    if task_deadline_reached "$deadline"; then
+      TASK_PROCESS_SCAN_EXPIRED=1
+      break
+    fi
     [ -e "$child_file" ] || continue
+    found=1
     children=""
-    if [ -r "$child_file" ]; then
-      inspected=1
-      IFS= read -r children <"$child_file" || true
+    if children="$(/bin/cat "$child_file" 2>/dev/null)"; then
+      :
     elif ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
-      if children="$("$SUDO_BIN" -n cat "$child_file" 2>/dev/null)"; then
-        inspected=1
-      else
-        children=""
-      fi
+      children="$("$SUDO_BIN" -n /bin/cat "$child_file" 2>/dev/null)" ||
+        return "$TASK_PROCESS_UNINSPECTABLE"
+    elif [ -e "$child_file" ]; then
+      return "$TASK_PROCESS_UNINSPECTABLE"
+    else
+      continue
     fi
     for child in $children; do
+      [[ "$child" =~ ^[0-9]+$ ]] || return "$TASK_PROCESS_UNINSPECTABLE"
       if [ -z "${seen[$child]:-}" ]; then
         seen[$child]=1
-        printf '%s\n' "$child"
+        TASK_PROCESS_CHILDREN+=( "$child" )
       fi
     done
   done
 
-  if [ "$inspected" -eq 0 ] && ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
-    children="$("$SUDO_BIN" -n /bin/sh -c 'cat "/proc/$1"/task/*/children' sh "$pid" 2>/dev/null)" || children=""
+  [ "$TASK_PROCESS_SCAN_EXPIRED" -eq 0 ] || return 0
+  if [ "$found" -eq 0 ] && ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
+    if ! children="$("$SUDO_BIN" -n /bin/sh -c '
+      found=0
+      for child_file in "/proc/$1"/task/*/children; do
+        [ -e "$child_file" ] || continue
+        found=1
+        /bin/cat "$child_file" || exit 1
+        printf " "
+      done
+      [ "$found" -eq 1 ]
+    ' sh "$pid" 2>/dev/null)"; then
+      if task_process_details "$pid"; then
+        [ "$TASK_PROCESS_START" = "$expected_start" ] || return "$TASK_PROCESS_GONE"
+        return "$TASK_PROCESS_UNINSPECTABLE"
+      else
+        status=$?
+      fi
+      [ "$status" -eq "$TASK_PROCESS_GONE" ] && return "$TASK_PROCESS_GONE"
+      return "$TASK_PROCESS_UNINSPECTABLE"
+    fi
     for child in $children; do
+      [[ "$child" =~ ^[0-9]+$ ]] || return "$TASK_PROCESS_UNINSPECTABLE"
       if [ -z "${seen[$child]:-}" ]; then
         seen[$child]=1
-        printf '%s\n' "$child"
+        TASK_PROCESS_CHILDREN+=( "$child" )
       fi
     done
+  elif [ "$found" -eq 0 ]; then
+    if task_process_details "$pid"; then
+      [ "$TASK_PROCESS_START" = "$expected_start" ] || return "$TASK_PROCESS_GONE"
+      return "$TASK_PROCESS_UNINSPECTABLE"
+    else
+      status=$?
+    fi
+    [ "$status" -eq "$TASK_PROCESS_GONE" ] && return "$TASK_PROCESS_GONE"
+    return "$TASK_PROCESS_UNINSPECTABLE"
   fi
 }
 
 signal_task_process() {
   local expected_start="$3"
   local pid="$2"
+  local status
   local task_signal="$1"
 
-  task_process_matches "$pid" "$expected_start" || return 0
+  if task_process_details "$pid"; then
+    [ "$TASK_PROCESS_START" = "$expected_start" ] || return 0
+    case "$TASK_PROCESS_STATE" in
+      Z|X) return 0 ;;
+    esac
+  else
+    status=$?
+    [ "$status" -eq "$TASK_PROCESS_GONE" ] && return 0
+    return "$TASK_PROCESS_UNINSPECTABLE"
+  fi
   if kill "-$task_signal" "$pid" 2>/dev/null; then
     return 0
   fi
-  task_process_matches "$pid" "$expected_start" || return 0
+
+  if task_process_details "$pid"; then
+    [ "$TASK_PROCESS_START" = "$expected_start" ] || return 0
+    case "$TASK_PROCESS_STATE" in
+      Z|X) return 0 ;;
+    esac
+  else
+    status=$?
+    [ "$status" -eq "$TASK_PROCESS_GONE" ] && return 0
+    return "$TASK_PROCESS_UNINSPECTABLE"
+  fi
   if ! is_root && command -v "$SUDO_BIN" >/dev/null 2>&1; then
     "$SUDO_BIN" -n /bin/kill "-$task_signal" "$pid" 2>/dev/null && return 0
+  fi
+
+  if task_process_details "$pid"; then
+    [ "$TASK_PROCESS_START" = "$expected_start" ] || return 0
+    case "$TASK_PROCESS_STATE" in
+      Z|X) return 0 ;;
+    esac
+  else
+    status=$?
+    [ "$status" -eq "$TASK_PROCESS_GONE" ] && return 0
+    return "$TASK_PROCESS_UNINSPECTABLE"
   fi
   return 1
 }
 
-terminate_task_process_children() {
-  local child
-  local child_start
-  local child_state
-  local pid="$1"
+task_time_milliseconds() {
+  local fraction
+  local seconds
+  local uptime
 
-  while read -r child; do
-    [ -n "$child" ] || continue
-    read -r child_start child_state < <(task_process_details "$child") || continue
-    terminate_task_process_tree "$child" "$child_start" || true
-  done < <(task_process_children "$pid")
+  IFS= read -r uptime </proc/uptime || return 1
+  uptime="${uptime%% *}"
+  seconds="${uptime%%.*}"
+  fraction="${uptime#*.}000"
+  fraction="${fraction:0:3}"
+  [[ "$seconds" =~ ^[0-9]+$ && "$fraction" =~ ^[0-9]+$ ]] || return 1
+  TASK_NOW_MILLISECONDS=$((10#$seconds * 1000 + 10#$fraction))
 }
 
-wait_for_task_process_stop() {
-  local attempts
-  local current_start
-  local expected_start="$2"
-  local limit="$3"
-  local pid="$1"
-  local state
+task_deadline_reached() {
+  local deadline="$1"
 
-  for ((attempts = 0; attempts < limit; attempts++)); do
-    terminate_task_process_children "$pid"
-    if ! read -r current_start state < <(task_process_details "$pid") || [ "$current_start" != "$expected_start" ]; then
+  if ! task_time_milliseconds; then
+    TASK_PROCESS_VERIFICATION_FAILED=1
+    return 0
+  fi
+  [ "$TASK_NOW_MILLISECONDS" -ge "$deadline" ]
+}
+
+track_task_process() {
+  local identity="$1:$2"
+
+  if [ -z "${TASK_TRACKED_PROCESS_SEEN[$identity]:-}" ]; then
+    TASK_TRACKED_PROCESS_SEEN[$identity]=1
+    TASK_TRACKED_PROCESS_IDENTITIES+=( "$identity" )
+  fi
+}
+
+collect_task_process_tree() {
+  local -a children=()
+  local child
+  local deadline="$3"
+  local expected_start="$2"
+  local pid="$1"
+  local start
+  local state
+  local status
+
+  if task_deadline_reached "$deadline"; then
+    TASK_PROCESS_SCAN_EXPIRED=1
+    return 1
+  fi
+  if task_process_details "$pid"; then
+    start="$TASK_PROCESS_START"
+    state="$TASK_PROCESS_STATE"
+  else
+    status=$?
+    if [ "$status" -eq "$TASK_PROCESS_UNINSPECTABLE" ]; then
+      TASK_PROCESS_VERIFICATION_FAILED=1
+    fi
+    return "$status"
+  fi
+  [ -z "$expected_start" ] || [ "$start" = "$expected_start" ] || return 0
+  case "$state" in
+    Z|X) return 0 ;;
+  esac
+
+  if task_process_children "$pid" "$start" "$deadline"; then
+    children=( "${TASK_PROCESS_CHILDREN[@]}" )
+  else
+    status=$?
+    children=( "${TASK_PROCESS_CHILDREN[@]}" )
+    if [ "$status" -eq "$TASK_PROCESS_UNINSPECTABLE" ]; then
+      TASK_PROCESS_VERIFICATION_FAILED=1
+    fi
+  fi
+
+  for child in "${children[@]}"; do
+    collect_task_process_tree "$child" "" "$deadline" || true
+  done
+  track_task_process "$pid" "$start"
+}
+
+signal_tracked_task_processes() {
+  local deadline="$2"
+  local expected_start
+  local identity
+  local pid
+  local status
+  local task_signal="$1"
+
+  for identity in "${TASK_TRACKED_PROCESS_IDENTITIES[@]}"; do
+    if task_deadline_reached "$deadline"; then
+      TASK_PROCESS_SCAN_EXPIRED=1
+      break
+    fi
+    pid="${identity%%:*}"
+    expected_start="${identity#*:}"
+    if signal_task_process "$task_signal" "$pid" "$expected_start"; then
+      :
+    else
+      status=$?
+      if [ "$status" -eq "$TASK_PROCESS_UNINSPECTABLE" ]; then
+        TASK_PROCESS_VERIFICATION_FAILED=1
+      fi
+    fi
+  done
+}
+
+verify_tracked_task_processes() {
+  local deadline="$1"
+  local expected_start
+  local identity
+  local pid
+  local status
+
+  TASK_ALL_TRACKED_PROCESSES_STOPPED=1
+  for identity in "${TASK_TRACKED_PROCESS_IDENTITIES[@]}"; do
+    if task_deadline_reached "$deadline"; then
+      TASK_PROCESS_SCAN_EXPIRED=1
+      TASK_ALL_TRACKED_PROCESSES_STOPPED=0
+      break
+    fi
+    pid="${identity%%:*}"
+    expected_start="${identity#*:}"
+    if task_process_details "$pid"; then
+      if [ "$TASK_PROCESS_START" = "$expected_start" ]; then
+        case "$TASK_PROCESS_STATE" in
+          Z|X) ;;
+          *) TASK_ALL_TRACKED_PROCESSES_STOPPED=0 ;;
+        esac
+      fi
+    else
+      status=$?
+      if [ "$status" -eq "$TASK_PROCESS_UNINSPECTABLE" ]; then
+        TASK_PROCESS_VERIFICATION_FAILED=1
+        TASK_ALL_TRACKED_PROCESSES_STOPPED=0
+      fi
+    fi
+  done
+}
+
+run_task_termination_phase() {
+  local deadline="$2"
+  local expected_start="$4"
+  local pid="$3"
+  local task_signal="$1"
+
+  while ! task_deadline_reached "$deadline"; do
+    TASK_PROCESS_SCAN_EXPIRED=0
+    collect_task_process_tree "$pid" "$expected_start" "$deadline" || true
+    signal_tracked_task_processes "$task_signal" "$deadline"
+    verify_tracked_task_processes "$deadline"
+    if [ "$TASK_PROCESS_VERIFICATION_FAILED" -eq 0 ] &&
+       [ "$TASK_PROCESS_SCAN_EXPIRED" -eq 0 ] &&
+       [ "$TASK_ALL_TRACKED_PROCESSES_STOPPED" -eq 1 ]; then
       return 0
     fi
-    if [ "$state" = Z ] || [ "$state" = X ]; then
-      return 0
-    fi
-    sleep 0.05
+    task_deadline_reached "$deadline" && break
+    sleep "$TASK_TERMINATION_POLL_SECONDS"
   done
   return 1
 }
 
 terminate_task_process_tree() {
   local expected_start="${2:-}"
+  local final_deadline
   local pid="$1"
   local start
-  local state
+  local status
+  local term_deadline
 
-  read -r start state < <(task_process_details "$pid") || return 0
+  TASK_PROCESS_SCAN_EXPIRED=0
+  TASK_PROCESS_VERIFICATION_FAILED=0
+  TASK_ALL_TRACKED_PROCESSES_STOPPED=0
+  TASK_TRACKED_PROCESS_IDENTITIES=()
+  TASK_TRACKED_PROCESS_SEEN=()
+
+  if task_process_details "$pid"; then
+    start="$TASK_PROCESS_START"
+  else
+    status=$?
+    [ "$status" -eq "$TASK_PROCESS_GONE" ] && return 0
+    printf 'Warning: unable to verify stopped task process %s.\n' "$pid" >&2
+    return 1
+  fi
   [ -z "$expected_start" ] || [ "$start" = "$expected_start" ] || return 0
+  if ! task_time_milliseconds; then
+    printf 'Warning: unable to verify stopped task process %s.\n' "$pid" >&2
+    return 1
+  fi
+  term_deadline=$((TASK_NOW_MILLISECONDS + TASK_TERMINATION_GRACE_MILLISECONDS))
+  final_deadline=$((TASK_NOW_MILLISECONDS + TASK_TERMINATION_TIMEOUT_MILLISECONDS))
 
-  terminate_task_process_children "$pid"
-  signal_task_process TERM "$pid" "$start" || true
-  wait_for_task_process_stop "$pid" "$start" "$TASK_TERMINATION_GRACE_ATTEMPTS" && return 0
+  run_task_termination_phase TERM "$term_deadline" "$pid" "$start" && return 0
+  run_task_termination_phase KILL "$final_deadline" "$pid" "$start" && return 0
 
-  signal_task_process KILL "$pid" "$start" || true
-  wait_for_task_process_stop "$pid" "$start" "$TASK_TERMINATION_KILL_ATTEMPTS" && return 0
-
-  printf 'Warning: unable to stop task process %s.\n' "$pid" >&2
+  printf 'Warning: unable to verify stopped task process %s.\n' "$pid" >&2
   return 1
 }
 
 cleanup_task_status() {
+  local pending_status
+
+  [ "$TASK_CLEANUP_ACTIVE" -eq 0 ] || return 0
+  TASK_CLEANUP_ACTIVE=1
   if [ -n "$TASK_COMMAND_PID" ]; then
-    terminate_task_process_tree "$TASK_COMMAND_PID" || true
-    wait "$TASK_COMMAND_PID" 2>/dev/null || true
+    if terminate_task_process_tree "$TASK_COMMAND_PID"; then
+      wait "$TASK_COMMAND_PID" 2>/dev/null || true
+    fi
   fi
 
   if [ -n "$TASK_SPINNER_PID" ]; then
@@ -203,12 +464,24 @@ cleanup_task_status() {
   TASK_LOG_FILE=""
   TASK_SPINNER_PID=""
   TASK_STATE_FILE=""
+  TASK_CLEANUP_ACTIVE=0
+
+  if [ -n "$TASK_PENDING_SIGNAL_STATUS" ]; then
+    pending_status="$TASK_PENDING_SIGNAL_STATUS"
+    TASK_PENDING_SIGNAL_STATUS=""
+    exit "$pending_status"
+  fi
 }
 
 handle_task_signal() {
   local status="$1"
 
-  trap - EXIT INT TERM HUP
+  trap '' INT TERM HUP
+  trap - EXIT
+  if [ "$TASK_CLEANUP_ACTIVE" -eq 1 ]; then
+    TASK_PENDING_SIGNAL_STATUS="$status"
+    return
+  fi
   cleanup_task_status
   exit "$status"
 }
