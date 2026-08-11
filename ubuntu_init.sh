@@ -820,7 +820,22 @@ target_user_has_command() {
   ' bash "$command_name"
 }
 
+ensure_target_user_local_bin_on_path() {
+  run_as_target_user bash -c '
+    local_bin_path='\''export PATH="$HOME/.local/bin:$PATH"'\''
+    zshrc="$HOME/.zshrc"
+
+    if [ -f "$zshrc" ] && grep -Fxq "$local_bin_path" "$zshrc"; then
+      exit 0
+    fi
+
+    printf "\n%s\n" "$local_bin_path" >>"$zshrc"
+  '
+}
+
 install_codex() {
+  ensure_target_user_local_bin_on_path || return
+
   if target_user_has_command codex; then
     return "$TASK_SKIPPED"
   fi
@@ -841,6 +856,8 @@ install_codex() {
 }
 
 install_code_review_graph() {
+  ensure_target_user_local_bin_on_path || return
+
   if target_user_has_command code-review-graph; then
     return "$TASK_SKIPPED"
   fi

@@ -35,15 +35,19 @@ def run_installer(
         driver = directory / "developer_tools_driver.sh"
         trace_file = directory / "trace"
         available_file = directory / "available"
+        target_home = directory / "home"
+        target_home.mkdir()
         available_file.write_text("".join(f"{name}\n" for name in existing))
 
         trace_path = shlex.quote(str(trace_file))
         available_path = shlex.quote(str(available_file))
+        target_home_path = shlex.quote(str(target_home))
         driver.write_text(
             script_definitions()
             + f"""
 TRACE_FILE={trace_path}
 AVAILABLE_FILE={available_path}
+TARGET_HOME={target_home_path}
 COMMAND_AVAILABLE_AFTER={int(command_available_after)}
 INSTALLER_EXIT={installer_exit}
 NODE_EXIT={node_exit}
@@ -94,7 +98,11 @@ export TRACE_FILE AVAILABLE_FILE COMMAND_AVAILABLE_AFTER INSTALLER_EXIT NODE_EXI
 run_as_target_user() {{
   case "$1" in
     bash)
-      "$@"
+      status=0
+      HOME="$TARGET_HOME" "$@" || status=$?
+      count=$(grep -Fxc 'export PATH="$HOME/.local/bin:$PATH"' "$TARGET_HOME/.zshrc" 2>/dev/null || true)
+      printf 'LOCAL_BIN_PATH_COUNT:%s\\n' "$count" >>"$TRACE_FILE"
+      return "$status"
       ;;
     pipx)
       printf 'TARGET:%s\\n' "$*" >>"$TRACE_FILE"
@@ -229,8 +237,19 @@ class DeveloperToolsInstallTest(unittest.TestCase):
     def test_codex_skips_when_present(self) -> None:
         result, trace = run_codex(existing={"codex", "node"})
         self.assertEqual(result.returncode, TASK_SKIPPED)
+        self.assertIn("LOCAL_BIN_PATH_COUNT:1", trace)
         self.assertNotIn("INSTALL_NODE", trace)
         self.assertNotIn("CODEX_INSTALLER", trace)
+
+    def test_local_bin_path_configuration_is_idempotent(self) -> None:
+        result, trace = run_installer(
+            "ensure_target_user_local_bin_on_path; "
+            "ensure_target_user_local_bin_on_path",
+            existing=set(),
+            command_available_after=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(trace.count("LOCAL_BIN_PATH_COUNT:1"), 2)
 
     def test_codex_installs_node_only_when_missing(self) -> None:
         result, trace = run_codex(existing=set(), codex_available_after=True)
@@ -272,6 +291,7 @@ class DeveloperToolsInstallTest(unittest.TestCase):
     def test_graph_skips_when_present(self) -> None:
         result, trace = run_graph(existing={"code-review-graph", "pipx"})
         self.assertEqual(result.returncode, TASK_SKIPPED)
+        self.assertIn("LOCAL_BIN_PATH_COUNT:1", trace)
         self.assertNotIn("APT:update", trace)
         self.assertNotIn("PIPX_INSTALL", trace)
         self.assertNotIn("TARGET:pipx install code-review-graph", trace)
