@@ -172,7 +172,7 @@ developer_modules_use_canonical_order() {
 }
 
 codex_installer_uses_official_pipeline() {
-  grep -Fq 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' "$ROOT_DIR/ubuntu_init.sh"
+  grep -Fq 'printf "y\n" | sh <(curl -fsSL https://chatgpt.com/codex/install.sh)' "$ROOT_DIR/ubuntu_init.sh"
 }
 
 code_review_graph_installer_uses_pipx() {
