@@ -489,7 +489,7 @@ handle_task_signal() {
 render_spinner() {
   local description="$1"
   local frame
-  local frames=( '|' '/' '-' '\\' )
+  local frames=( '|' '/' '-' '\' )
   local index=0
 
   while true; do
@@ -846,7 +846,8 @@ install_codex() {
 
   run_as_target_user bash -c '
     set -euo pipefail
-    printf "y\n" | sh <(curl -fsSL https://chatgpt.com/codex/install.sh)
+    curl -fsSL https://chatgpt.com/codex/install.sh |
+      CODEX_NON_INTERACTIVE=1 sh
   ' || return
 
   if ! target_user_has_command codex; then
