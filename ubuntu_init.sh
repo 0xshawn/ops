@@ -831,7 +831,7 @@ install_codex() {
 
   run_as_target_user bash -c '
     set -euo pipefail
-    curl -fsSL https://chatgpt.com/codex/install.sh | sh
+    printf "y\n" | sh <(curl -fsSL https://chatgpt.com/codex/install.sh)
   ' || return
 
   if ! target_user_has_command codex; then
