@@ -221,6 +221,20 @@ main install_common_tools
 
 
 class TaskStatusTest(unittest.TestCase):
+    def test_spinner_uses_single_character_frames(self):
+        result = run_driver(
+            """
+spinner_sleep_count=0
+sleep() {
+  spinner_sleep_count=$((spinner_sleep_count + 1))
+  [ "$spinner_sleep_count" -lt 4 ] || exit 0
+}
+render_spinner "Task"
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "\n| Task\n/ Task\n- Task\n\\ Task")
+
     def test_success_hides_command_output(self):
         result = run_driver("run_task 'Successful task' bash -c 'echo hidden-output'")
         self.assertEqual(result.returncode, 0)

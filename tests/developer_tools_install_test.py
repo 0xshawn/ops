@@ -85,6 +85,7 @@ curl() {{
 sh() {{
   input_hex=$(od -An -tx1 | tr -d ' \\n')
   printf 'CODEX_INPUT:%s\\n' "$input_hex" >>"$TRACE_FILE"
+  printf 'CODEX_NON_INTERACTIVE:%s\\n' "$(printenv CODEX_NON_INTERACTIVE)" >>"$TRACE_FILE"
   printf 'CODEX_INSTALLER\\n' >>"$TRACE_FILE"
   if [ "$INSTALLER_EXIT" -eq 0 ] && [ "$COMMAND_AVAILABLE_AFTER" -eq 1 ]; then
     printf 'codex\\n' >>"$AVAILABLE_FILE"
@@ -261,10 +262,11 @@ class DeveloperToolsInstallTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("INSTALL_NODE", trace)
 
-    def test_codex_confirms_installer_once(self) -> None:
+    def test_codex_uses_non_interactive_installer(self) -> None:
         result, trace = run_codex(existing={"node"}, codex_available_after=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("CODEX_INPUT:790a", trace)
+        self.assertIn("CODEX_NON_INTERACTIVE:1", trace)
+        self.assertIn("CODEX_INPUT:", trace)
 
     def test_codex_rejects_missing_command_after_installer(self) -> None:
         result, _ = run_codex(existing={"node"}, codex_available_after=False)
