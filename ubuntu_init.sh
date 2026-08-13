@@ -977,12 +977,15 @@ configure_user_ssh_key() {
   local home="$2"
   local group="$3"
   local public_key="$4"
+  local status=0
 
-  run_as_root bash -c '
+  local original_home="$TARGET_HOME"
+  local original_user="$TARGET_USER"
+  TARGET_USER="$username"
+  TARGET_HOME="$home"
+  run_as_target_user bash -c '
     set -euo pipefail
-    username=$1
     home=$2
-    group=$3
     public_key=$4
     ssh_dir="$home/.ssh"
     authorized_keys="$ssh_dir/authorized_keys"
@@ -1001,8 +1004,10 @@ configure_user_ssh_key() {
       printf "%s\n" "$public_key" >>"$authorized_keys"
     fi
     chmod 0600 "$authorized_keys"
-    chown "$username:$group" "$ssh_dir" "$authorized_keys"
-  ' bash "$username" "$home" "$group" "$public_key"
+  ' bash "$username" "$home" "$group" "$public_key" || status=$?
+  TARGET_USER="$original_user"
+  TARGET_HOME="$original_home"
+  return "$status"
 }
 
 validate_user_ssh_paths() {

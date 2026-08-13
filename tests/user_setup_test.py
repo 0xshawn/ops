@@ -116,7 +116,7 @@ printf 'KEYS_BEGIN\n'; cat "$TEST_KEYS"; printf 'KEYS_END\n'
     def run_real_ssh_helper(self, home: Path, key: str) -> subprocess.CompletedProcess[str]:
         driver = home.parent / "ssh_driver.sh"
         driver.write_text(script_definitions() + f'''
-run_as_root() {{ "$@"; }}
+run_as_root() {{ echo 'root execution forbidden' >&2; return 99; }}
 configure_user_ssh_key {shlex.quote(os.getlogin() if os.isatty(0) else subprocess.check_output(["id", "-un"], text=True).strip())} {shlex.quote(str(home))} {shlex.quote(subprocess.check_output(["id", "-gn"], text=True).strip())} {shlex.quote(key)}
 ''')
         return subprocess.run(["/bin/bash", str(driver)], capture_output=True, text=True)
@@ -137,6 +137,7 @@ configure_user_ssh_key {shlex.quote(os.getlogin() if os.isatty(0) else subproces
             self.assertEqual(keys.read_text().splitlines(), ["ssh-rsa OLD existing", key])
             self.assertEqual(ssh_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(keys.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("root execution forbidden", first.stderr)
 
     def test_real_ssh_helper_rejects_symlinks_without_mutation(self) -> None:
         for link_name in (".ssh", "authorized_keys"):
