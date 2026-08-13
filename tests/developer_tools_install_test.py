@@ -234,7 +234,174 @@ install_code_review_graph
     return result, trace
 
 
+def run_superpowers(
+    repository: str = "missing",
+    link: str = "missing",
+    tags: tuple[str, ...] = ("v6.2.0", "v6.3.0", "v6.3.0-rc1"),
+    described_tag: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[str], dict[str, bool | str]]:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        directory = Path(temporary_directory)
+        target_home = directory / "home"
+        checkout = target_home / ".codex" / "superpowers"
+        skill_link = target_home / ".agents" / "skills" / "superpowers"
+        fake_bin = directory / "bin"
+        fake_bin.mkdir()
+        target_home.mkdir()
+        trace_file = directory / "trace"
+        state_file = directory / "tag"
+
+        if repository != "missing":
+            (checkout / ".git").mkdir(parents=True)
+            (checkout / "skills").mkdir()
+            (checkout / "origin").write_text(repository)
+            state_file.write_text("v6.2.0\n")
+        if link == "correct":
+            skill_link.parent.mkdir(parents=True)
+            skill_link.symlink_to(checkout / "skills")
+        elif link == "wrong-dangling":
+            skill_link.parent.mkdir(parents=True)
+            skill_link.symlink_to(target_home / "missing" / "skills")
+        elif link == "conflict":
+            skill_link.parent.mkdir(parents=True)
+            skill_link.write_text("keep me")
+
+        git = fake_bin / "git"
+        tag_output = " ".join(f"'{index} refs/tags/{tag}'" for index, tag in enumerate(tags))
+        describe_command = (
+            f"printf '%s\\n' {shlex.quote(described_tag)}"
+            if described_tag is not None
+            else 'cat "$STATE_FILE"'
+        )
+        git.write_text(
+            "#!/bin/bash\n"
+            "[ \"$SUPERPOWERS_TARGET_WRAPPER\" = 1 ] || exit 97\n"
+            "printf 'git:%s\\n' \"$*\" >>\"$TRACE_FILE\"\n"
+            "case \"$1\" in\n"
+            f"  ls-remote) printf '%s\\n' {tag_output} ;;\n"
+            "  clone) dest=\"${@: -1}\"; mkdir -p \"$dest/.git\" \"$dest/skills\"; "
+            "printf '%s\\n' 'https://github.com/obra/superpowers.git' >\"$dest/origin\"; printf '%s\\n' v6.3.0 >\"$STATE_FILE\" ;;\n"
+            "  -C)\n"
+            "    repo=$2; shift 2\n"
+            "    case \"$1\" in\n"
+            "      config) cat \"$repo/origin\" ;;\n"
+            "      fetch) : ;;\n"
+            "      checkout) printf '%s\\n' \"${@: -1}\" >\"$STATE_FILE\" ;;\n"
+            f"      describe) {describe_command} ;;\n"
+            "    esac ;;\n"
+            "esac\n"
+        )
+        git.chmod(0o755)
+        ln = fake_bin / "ln"
+        ln.write_text(
+            "#!/bin/bash\n"
+            "[ \"$SUPERPOWERS_TARGET_WRAPPER\" = 1 ] || exit 98\n"
+            "printf 'ln:%s\\n' \"$*\" >>\"$TRACE_FILE\"\n"
+            "exec /usr/bin/ln \"$@\"\n"
+        )
+        ln.chmod(0o755)
+        driver = directory / "superpowers_driver.sh"
+        driver.write_text(
+            script_definitions()
+            + f"""
+TARGET_HOME={shlex.quote(str(target_home))}
+export TRACE_FILE={shlex.quote(str(trace_file))}
+export STATE_FILE={shlex.quote(str(state_file))}
+export PATH={shlex.quote(str(fake_bin))}:/usr/bin:/bin
+run_as_target_user() {{ SUPERPOWERS_TARGET_WRAPPER=1 HOME="$TARGET_HOME" "$@"; }}
+install_superpowers
+"""
+        )
+        result = subprocess.run(["/bin/bash", str(driver)], capture_output=True, text=True)
+        trace = trace_file.read_text().splitlines() if trace_file.exists() else []
+        evidence: dict[str, bool | str] = {
+            "link_is_symlink": skill_link.is_symlink(),
+            "link_target": str(skill_link.resolve()) if skill_link.is_symlink() else "",
+            "expected_target": str((checkout / "skills").resolve()),
+            "conflict_preserved": (
+                skill_link.is_file()
+                and not skill_link.is_symlink()
+                and skill_link.read_text() == "keep me"
+            ),
+        }
+    return result, trace, evidence
+
+
 class DeveloperToolsInstallTest(unittest.TestCase):
+    def test_superpowers_first_install_uses_latest_release_and_links_skills(self) -> None:
+        result, trace, evidence = run_superpowers()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("git:ls-remote --tags --refs https://github.com/obra/superpowers.git", trace)
+        self.assertTrue(any(line.startswith(
+            "git:clone --branch v6.3.0 --depth 1 https://github.com/obra/superpowers.git "
+        ) for line in trace))
+        self.assertTrue(evidence["link_is_symlink"])
+        self.assertEqual(evidence["link_target"], evidence["expected_target"])
+        self.assertTrue(any(line.startswith("ln:-s ") for line in trace))
+
+    def test_superpowers_accepts_correct_dangling_link_before_clone(self) -> None:
+        result, trace, _ = run_superpowers(link="correct")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("clone" in line for line in trace))
+
+    def test_superpowers_rejects_wrong_dangling_link_before_clone(self) -> None:
+        result, trace, _ = run_superpowers(link="wrong-dangling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("clone" in line for line in trace))
+
+    def test_superpowers_updates_official_checkout(self) -> None:
+        result, trace, _ = run_superpowers(
+            repository="https://github.com/obra/superpowers.git", link="correct"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(line.startswith("git:-C ") for line in trace))
+        self.assertTrue(any("fetch --depth 1 origin tag v6.3.0" in line for line in trace))
+        self.assertTrue(any("checkout --detach v6.3.0" in line for line in trace))
+
+    def test_superpowers_existing_latest_checkout_and_link_are_idempotent(self) -> None:
+        result, trace, evidence = run_superpowers(
+            repository="https://github.com/obra/superpowers.git",
+            link="correct",
+            described_tag="v6.3.0",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("fetch --depth 1 origin tag v6.3.0" in line for line in trace))
+        self.assertTrue(any("checkout --detach v6.3.0" in line for line in trace))
+        self.assertTrue(evidence["link_is_symlink"])
+        self.assertEqual(evidence["link_target"], evidence["expected_target"])
+
+    def test_superpowers_rejects_non_official_checkout(self) -> None:
+        result, trace, _ = run_superpowers(repository="https://example.com/other.git")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("fetch" in line or "checkout" in line for line in trace))
+
+    def test_superpowers_accepts_official_origin_without_dot_git(self) -> None:
+        result, _, _ = run_superpowers(
+            repository="https://github.com/obra/superpowers", link="correct"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_superpowers_fails_when_no_semantic_release_exists(self) -> None:
+        result, trace, _ = run_superpowers(tags=("v6.3.0-rc1", "release"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("clone" in line for line in trace))
+
+    def test_superpowers_fails_when_checkout_verification_mismatches(self) -> None:
+        result, _, _ = run_superpowers(described_tag="v6.2.0")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_superpowers_preserves_conflicting_link(self) -> None:
+        result, trace, evidence = run_superpowers(link="conflict")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(evidence["conflict_preserved"])
+        self.assertFalse(any("clone" in line or "fetch" in line for line in trace))
+
+    def test_superpowers_is_registered_after_codex(self) -> None:
+        definitions = script_definitions()
+        order = definitions.index("  install_codex\n  install_superpowers")
+        self.assertGreaterEqual(order, 0)
+        self.assertIn('install_superpowers) printf \'%s\' "Installing Superpowers"', definitions)
+
     def test_codex_skips_when_present(self) -> None:
         result, trace = run_codex(existing={"codex", "node"})
         self.assertEqual(result.returncode, TASK_SKIPPED)

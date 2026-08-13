@@ -856,6 +856,62 @@ install_codex() {
   fi
 }
 
+install_superpowers() {
+  run_as_target_user bash -c '
+    set -euo pipefail
+
+    repository_url="https://github.com/obra/superpowers.git"
+    checkout="$HOME/.codex/superpowers"
+    skills="$checkout/skills"
+    link="$HOME/.agents/skills/superpowers"
+
+    if [ -e "$link" ] || [ -L "$link" ]; then
+      if [ ! -L "$link" ] || [ "$(readlink -m "$link")" != "$(readlink -m "$skills")" ]; then
+        printf "%s\n" "Superpowers skill path already exists and is not the expected link: $link" >&2
+        exit 1
+      fi
+    fi
+
+    if [ -e "$checkout" ] && [ ! -d "$checkout/.git" ]; then
+      printf "%s\n" "Superpowers checkout path is not a Git repository: $checkout" >&2
+      exit 1
+    fi
+
+    tag=$(
+      git ls-remote --tags --refs "$repository_url" |
+        awk '\''{ sub("refs/tags/", "", $2); print $2 }'\'' |
+        grep -E '\''^v[0-9]+\.[0-9]+\.[0-9]+$'\'' |
+        sort -V |
+        tail -n 1
+    ) || true
+    if [ -z "$tag" ]; then
+      printf "%s\n" "No semantic Superpowers release tag was found." >&2
+      exit 1
+    fi
+
+    if [ -d "$checkout/.git" ]; then
+      origin=$(git -C "$checkout" config --get remote.origin.url)
+      if [ "$origin" != "$repository_url" ] && [ "$origin" != "${repository_url%.git}" ]; then
+        printf "%s\n" "Existing Superpowers checkout is not the official repository: $checkout" >&2
+        exit 1
+      fi
+      git -C "$checkout" fetch --depth 1 origin tag "$tag"
+      git -C "$checkout" checkout --detach "$tag"
+    else
+      mkdir -p "$(dirname "$checkout")"
+      git clone --branch "$tag" --depth 1 "$repository_url" "$checkout"
+    fi
+
+    mkdir -p "$(dirname "$link")"
+    if [ ! -L "$link" ]; then
+      ln -s "$skills" "$link"
+    fi
+
+    [ "$(git -C "$checkout" describe --tags --exact-match)" = "$tag" ]
+    [ "$(readlink -f "$link")" = "$(readlink -f "$skills")" ]
+  '
+}
+
 install_code_review_graph() {
   ensure_target_user_local_bin_on_path || return
 
@@ -909,6 +965,138 @@ install_docker() {
 
   run_as_root systemctl enable docker || return
   run_as_root systemctl restart docker
+}
+
+read_user_setup_input() {
+  local prompt="$1"
+  IFS= read -r -p "$prompt" REPLY </dev/tty
+}
+
+configure_user_ssh_key() {
+  local username="$1"
+  local home="$2"
+  local group="$3"
+  local public_key="$4"
+  local status=0
+
+  local original_home="$TARGET_HOME"
+  local original_user="$TARGET_USER"
+  TARGET_USER="$username"
+  TARGET_HOME="$home"
+  run_as_target_user bash -c '
+    set -euo pipefail
+    home=$2
+    public_key=$4
+    ssh_dir="$home/.ssh"
+    authorized_keys="$ssh_dir/authorized_keys"
+    if [ -L "$ssh_dir" ] || { [ -e "$ssh_dir" ] && [ ! -d "$ssh_dir" ]; }; then
+      echo "Unsafe SSH directory: $ssh_dir" >&2
+      exit 1
+    fi
+    if [ -L "$authorized_keys" ] || { [ -e "$authorized_keys" ] && [ ! -f "$authorized_keys" ]; }; then
+      echo "Unsafe authorized_keys path: $authorized_keys" >&2
+      exit 1
+    fi
+    mkdir -p "$ssh_dir"
+    chmod 0700 "$ssh_dir"
+    touch "$authorized_keys"
+    if ! grep -Fqx -- "$public_key" "$authorized_keys"; then
+      printf "%s\n" "$public_key" >>"$authorized_keys"
+    fi
+    chmod 0600 "$authorized_keys"
+  ' bash "$username" "$home" "$group" "$public_key" || status=$?
+  TARGET_USER="$original_user"
+  TARGET_HOME="$original_home"
+  return "$status"
+}
+
+validate_user_ssh_paths() {
+  local home="$1"
+
+  run_as_root bash -c '
+    set -euo pipefail
+    ssh_dir="$1/.ssh"
+    authorized_keys="$ssh_dir/authorized_keys"
+    if [ -L "$ssh_dir" ] || { [ -e "$ssh_dir" ] && [ ! -d "$ssh_dir" ]; }; then
+      echo "Unsafe SSH directory: $ssh_dir" >&2
+      exit 1
+    fi
+    if [ -L "$authorized_keys" ] || { [ -e "$authorized_keys" ] && [ ! -f "$authorized_keys" ]; }; then
+      echo "Unsafe authorized_keys path: $authorized_keys" >&2
+      exit 1
+    fi
+  ' bash "$home"
+}
+
+create_user() {
+  local account
+  local gid
+  local group
+  local home
+  local public_key
+  local uid
+  local uid_min
+  local username
+
+  if ! has_controlling_terminal; then
+    log_step "No controlling terminal; skipping user setup"
+    return "$TASK_SKIPPED"
+  fi
+
+  while true; do
+    read_user_setup_input "Username (leave empty to skip): " || return "$TASK_SKIPPED"
+    username="$REPLY"
+    [ -n "$username" ] || return "$TASK_SKIPPED"
+    [[ "$username" =~ ^[a-z][a-z0-9_-]*$ ]] && break
+    echo "Invalid username. Use lowercase letters, digits, underscores, or hyphens." >&2
+  done
+
+  while true; do
+    read_user_setup_input "SSH public key (optional): " || return "$TASK_SKIPPED"
+    public_key="$REPLY"
+    [ -z "$public_key" ] && break
+    if [[ "$public_key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^[:space:]]+)[[:space:]]+[^[:space:]]+([[:space:]].*)?$ ]]; then
+      break
+    fi
+    echo "Invalid SSH public key. Enter a single-line OpenSSH public key." >&2
+  done
+
+  if ! getent passwd "$username" >/dev/null; then
+    run_as_root adduser --disabled-password --gecos "" "$username" || return
+  fi
+  account="$(getent passwd "$username")" || {
+    die "Unable to resolve account after creating user: $username"
+    return 1
+  }
+  IFS=: read -r _ _ uid gid _ home _ <<<"$account"
+  uid_min="$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null)"
+  [[ "$uid_min" =~ ^[0-9]+$ ]] || uid_min=1000
+  if ! [[ "$uid" =~ ^[0-9]+$ ]] || [ "$uid" -eq 0 ] || [ "$uid" -lt "$uid_min" ]; then
+    die "Refusing to configure root or system account: $username"
+    return 1
+  fi
+  if [ -z "$home" ] || [[ "$home" != /* ]] || [ "$home" = / ]; then
+    die "Unsafe home directory for user $username: $home"
+    return 1
+  fi
+  group="$(getent group "$gid" | cut -d: -f1)" || {
+    die "Unable to resolve primary group for user: $username"
+    return 1
+  }
+  [ -n "$group" ] || {
+    die "Unable to resolve primary group for user: $username"
+    return 1
+  }
+
+  [ -z "$public_key" ] || validate_user_ssh_paths "$home" || return
+
+  run_as_root usermod -aG sudo "$username" || return
+  if getent group docker >/dev/null; then
+    run_as_root usermod -aG docker "$username" || return
+  else
+    log_step "Docker group does not exist; skipping Docker membership"
+  fi
+  [ -z "$public_key" ] || configure_user_ssh_key "$username" "$home" "$group" "$public_key"
 }
 
 configure_vim() {
@@ -973,10 +1161,12 @@ readonly MODULE_ORDER=(
   initialize_zsh
   install_node
   install_codex
+  install_superpowers
   install_code_review_graph
   set_default_editor
   configure_docker
   install_docker
+  create_user
   configure_vim
   configure_passwordless_sudo
   configure_journald
@@ -1003,11 +1193,11 @@ category_modules() {
       printf '%s' "install_common_tools initialize_zsh set_default_editor configure_vim"
       ;;
     development_tools)
-      printf '%s' "install_node install_codex install_code_review_graph"
+      printf '%s' "install_node install_codex install_superpowers install_code_review_graph"
       ;;
     docker) printf '%s' "configure_docker install_docker" ;;
     system_configuration)
-      printf '%s' "configure_passwordless_sudo configure_journald configure_logrotate disable_apt_daily_timers disable_welcome_message"
+      printf '%s' "create_user configure_passwordless_sudo configure_journald configure_logrotate disable_apt_daily_timers disable_welcome_message"
       ;;
     *) die "Missing modules for category: $1" ;;
   esac
@@ -1019,10 +1209,12 @@ module_description() {
     initialize_zsh) printf '%s' "Initializing zsh" ;;
     install_node) printf '%s' "Installing Node.js" ;;
     install_codex) printf '%s' "Installing Codex" ;;
+    install_superpowers) printf '%s' "Installing Superpowers" ;;
     install_code_review_graph) printf '%s' "Installing code-review-graph" ;;
     set_default_editor) printf '%s' "Setting default editor" ;;
     configure_docker) printf '%s' "Configuring Docker" ;;
     install_docker) printf '%s' "Installing Docker" ;;
+    create_user) printf '%s' "Creating or configuring a user" ;;
     configure_vim) printf '%s' "Configuring Vim" ;;
     configure_passwordless_sudo) printf '%s' "Configuring passwordless sudo" ;;
     configure_journald) printf '%s' "Configuring journald" ;;
@@ -1040,6 +1232,10 @@ is_known_module() {
     [ "$module" = "$candidate" ] && return 0
   done
   return 1
+}
+
+is_default_module() {
+  [ "$1" != create_user ]
 }
 
 list_modules() {
@@ -1091,7 +1287,11 @@ select_modules_interactively() {
   trap 'cleanup_interactive_menu; cleanup_task_status; exit 130' INT TERM HUP
 
   for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
-    selected[index]=1
+    if is_default_module "${MODULE_ORDER[$index]}"; then
+      selected[index]=1
+    else
+      selected[index]=0
+    fi
   done
 
   printf '\033[?25l' >&3
@@ -1343,6 +1543,7 @@ is_selected_module() {
 }
 
 main() {
+  local all_requested=0
   local original_arg_count="$#"
   local run_all=1
   local selected_modules=""
@@ -1358,7 +1559,7 @@ main() {
         exit 0
         ;;
       all)
-        run_all=1
+        all_requested=1
         ;;
       -*)
         die "Unknown option: $1 (use --help for usage)"
@@ -1375,6 +1576,10 @@ main() {
     esac
     shift
   done
+
+  if [ "$original_arg_count" -gt 0 ]; then
+    run_all="$all_requested"
+  fi
 
   if [ "$original_arg_count" -eq 0 ] && has_controlling_terminal; then
     select_modules_interactively || {
@@ -1396,7 +1601,8 @@ main() {
 
   local module
   for module in "${MODULE_ORDER[@]}"; do
-    if [ "$run_all" -eq 1 ] || is_selected_module "$module" "$selected_modules"; then
+    if { [ "$run_all" -eq 1 ] && is_default_module "$module"; } ||
+      is_selected_module "$module" "$selected_modules"; then
       run_module "$module"
     fi
   done

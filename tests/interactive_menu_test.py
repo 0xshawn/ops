@@ -21,10 +21,12 @@ MODULES = [
     "initialize_zsh",
     "install_node",
     "install_codex",
+    "install_superpowers",
     "install_code_review_graph",
     "set_default_editor",
     "configure_docker",
     "install_docker",
+    "create_user",
     "configure_vim",
     "configure_passwordless_sudo",
     "configure_journald",
@@ -41,10 +43,12 @@ BASE_TOOLS = [
 DEVELOPMENT_TOOLS = [
     "install_node",
     "install_codex",
+    "install_superpowers",
     "install_code_review_graph",
 ]
 DOCKER = ["configure_docker", "install_docker"]
 SYSTEM_CONFIGURATION = [
+    "create_user",
     "configure_passwordless_sudo",
     "configure_journald",
     "configure_logrotate",
@@ -179,7 +183,7 @@ class InteractiveMenuTest(unittest.TestCase):
 
     def test_categories_start_collapsed_and_all_modules_selected(self) -> None:
         output, selected = self.run_menu(b"\r")
-        self.assertEqual(selected, MODULES)
+        self.assertEqual(selected, [module for module in MODULES if module != "create_user"])
         self.assertIn("[x] Base tools", output)
         self.assertIn("[x] Development tools", output)
         self.assertNotIn("install_common_tools", first_render(output))
@@ -192,7 +196,7 @@ class InteractiveMenuTest(unittest.TestCase):
 
     def test_space_clears_an_entire_category(self) -> None:
         _, selected = self.run_menu(b" \r")
-        self.assertEqual(selected, [module for module in MODULES if module not in BASE_TOOLS])
+        self.assertEqual(selected, [module for module in MODULES if module not in BASE_TOOLS and module != "create_user"])
 
     def test_child_toggle_gives_category_partial_marker(self) -> None:
         output, selected = self.run_menu(b"\x1b[C\x1b[B \r")
@@ -249,12 +253,48 @@ class InteractiveMenuTest(unittest.TestCase):
             selected_trace = trace_file.read_text().splitlines()
 
         self.assertEqual(run_all.stderr, "")
-        self.assertEqual(run_all_trace, MODULES)
+        self.assertEqual(run_all_trace, [module for module in MODULES if module != "create_user"])
         self.assertEqual(selected.stderr, "")
         self.assertEqual(
             selected_trace,
             ["install_common_tools", "disable_welcome_message"],
         )
+
+    def test_create_user_runs_only_when_explicitly_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            driver, trace_file = create_main_driver(directory)
+            subprocess.run(
+                ["/bin/bash", str(driver), "create_user"],
+                capture_output=True,
+                text=True,
+                check=True,
+                start_new_session=True,
+            )
+            explicit_trace = trace_file.read_text().splitlines()
+            trace_file.unlink()
+            subprocess.run(
+                ["/bin/bash", str(driver), "all", "create_user"],
+                capture_output=True,
+                text=True,
+                check=True,
+                start_new_session=True,
+            )
+            combined_trace = trace_file.read_text().splitlines()
+
+            trace_file.unlink()
+            subprocess.run(
+                ["/bin/bash", str(driver), "create_user", "all"],
+                capture_output=True,
+                text=True,
+                check=True,
+                start_new_session=True,
+            )
+            reverse_combined_trace = trace_file.read_text().splitlines()
+
+        self.assertEqual(explicit_trace, ["create_user"])
+        self.assertEqual(combined_trace, MODULES)
+        self.assertEqual(reverse_combined_trace, MODULES)
 
     def test_help_argument_bypasses_menu_in_a_tty(self) -> None:
         status, output = run_pty(["/bin/bash", str(SCRIPT_PATH), "--help"])
