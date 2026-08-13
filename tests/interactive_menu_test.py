@@ -21,6 +21,7 @@ MODULES = [
     "initialize_zsh",
     "install_node",
     "install_codex",
+    "install_superpowers",
     "install_code_review_graph",
     "set_default_editor",
     "configure_docker",
@@ -42,6 +43,7 @@ BASE_TOOLS = [
 DEVELOPMENT_TOOLS = [
     "install_node",
     "install_codex",
+    "install_superpowers",
     "install_code_review_graph",
 ]
 DOCKER = ["configure_docker", "install_docker"]
