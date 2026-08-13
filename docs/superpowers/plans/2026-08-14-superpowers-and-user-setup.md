@@ -144,3 +144,4 @@ git commit -m "docs: describe setup modules"
 - Recognize the official checkout only when its normalized origin is `https://github.com/obra/superpowers` (optional `.git`).
 - Complete repository and link conflict checks before any clone, fetch, or directory creation.
 - Refuse SSH configuration when the resolved account home is empty, non-absolute, or `/`; resolve the primary group through the passwd GID.
+- Reject UID 0 and existing accounts below `UID_MIN` before changing groups or SSH files, preventing service-account privilege escalation.

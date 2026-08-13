@@ -47,7 +47,10 @@ optional comment. Invalid input is explained and requested again.
 
 For a missing account, the module runs
 `adduser --disabled-password --gecos "" USERNAME`. An existing account is
-reused. It always ensures membership in `sudo`. It adds membership in `docker`
+reused only when it is a regular login account: UID 0 and UIDs below the
+system's `UID_MIN` (default `1000`) are rejected before any mutation. This
+prevents accidental promotion of root and service accounts. It always ensures
+membership in `sudo`. It adds membership in `docker`
 only when that group exists; a missing Docker group produces an informational
 message rather than failure.
 

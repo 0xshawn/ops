@@ -82,4 +82,5 @@ and symbolic links instead of overwriting them.
 `create_user` is excluded from `all` unless named explicitly. An empty username
 or unavailable controlling terminal skips it; an empty SSH-key response still
 configures the account without creating `authorized_keys`. Passwordless sudo is
-configured separately by `configure_passwordless_sudo`.
+configured separately by `configure_passwordless_sudo`. Root and system
+accounts below the configured `UID_MIN` are rejected before any changes.
