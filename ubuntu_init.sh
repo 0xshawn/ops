@@ -856,6 +856,62 @@ install_codex() {
   fi
 }
 
+install_superpowers() {
+  run_as_target_user bash -c '
+    set -euo pipefail
+
+    repository_url="https://github.com/obra/superpowers.git"
+    checkout="$HOME/.codex/superpowers"
+    skills="$checkout/skills"
+    link="$HOME/.agents/skills/superpowers"
+
+    if [ -e "$link" ] || [ -L "$link" ]; then
+      if [ ! -L "$link" ] || [ "$(readlink -m "$link")" != "$(readlink -m "$skills")" ]; then
+        printf "%s\n" "Superpowers skill path already exists and is not the expected link: $link" >&2
+        exit 1
+      fi
+    fi
+
+    if [ -e "$checkout" ] && [ ! -d "$checkout/.git" ]; then
+      printf "%s\n" "Superpowers checkout path is not a Git repository: $checkout" >&2
+      exit 1
+    fi
+
+    tag=$(
+      git ls-remote --tags --refs "$repository_url" |
+        awk '\''{ sub("refs/tags/", "", $2); print $2 }'\'' |
+        grep -E '\''^v[0-9]+\.[0-9]+\.[0-9]+$'\'' |
+        sort -V |
+        tail -n 1
+    ) || true
+    if [ -z "$tag" ]; then
+      printf "%s\n" "No semantic Superpowers release tag was found." >&2
+      exit 1
+    fi
+
+    if [ -d "$checkout/.git" ]; then
+      origin=$(git -C "$checkout" config --get remote.origin.url)
+      if [ "$origin" != "$repository_url" ] && [ "$origin" != "${repository_url%.git}" ]; then
+        printf "%s\n" "Existing Superpowers checkout is not the official repository: $checkout" >&2
+        exit 1
+      fi
+      git -C "$checkout" fetch --depth 1 origin tag "$tag"
+      git -C "$checkout" checkout --detach "$tag"
+    else
+      mkdir -p "$(dirname "$checkout")"
+      git clone --branch "$tag" --depth 1 "$repository_url" "$checkout"
+    fi
+
+    mkdir -p "$(dirname "$link")"
+    if [ ! -L "$link" ]; then
+      ln -s "$skills" "$link"
+    fi
+
+    [ "$(git -C "$checkout" describe --tags --exact-match)" = "$tag" ]
+    [ "$(readlink -f "$link")" = "$(readlink -f "$skills")" ]
+  '
+}
+
 install_code_review_graph() {
   ensure_target_user_local_bin_on_path || return
 
@@ -973,6 +1029,7 @@ readonly MODULE_ORDER=(
   initialize_zsh
   install_node
   install_codex
+  install_superpowers
   install_code_review_graph
   set_default_editor
   configure_docker
@@ -1003,7 +1060,7 @@ category_modules() {
       printf '%s' "install_common_tools initialize_zsh set_default_editor configure_vim"
       ;;
     development_tools)
-      printf '%s' "install_node install_codex install_code_review_graph"
+      printf '%s' "install_node install_codex install_superpowers install_code_review_graph"
       ;;
     docker) printf '%s' "configure_docker install_docker" ;;
     system_configuration)
@@ -1019,6 +1076,7 @@ module_description() {
     initialize_zsh) printf '%s' "Initializing zsh" ;;
     install_node) printf '%s' "Installing Node.js" ;;
     install_codex) printf '%s' "Installing Codex" ;;
+    install_superpowers) printf '%s' "Installing Superpowers" ;;
     install_code_review_graph) printf '%s' "Installing code-review-graph" ;;
     set_default_editor) printf '%s' "Setting default editor" ;;
     configure_docker) printf '%s' "Configuring Docker" ;;
