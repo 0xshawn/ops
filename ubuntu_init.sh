@@ -967,6 +967,97 @@ install_docker() {
   run_as_root systemctl restart docker
 }
 
+read_user_setup_input() {
+  local prompt="$1"
+  IFS= read -r -p "$prompt" REPLY </dev/tty
+}
+
+configure_user_ssh_key() {
+  local username="$1"
+  local home="$2"
+  local group="$3"
+  local public_key="$4"
+
+  run_as_root bash -c '
+    set -euo pipefail
+    username=$1
+    home=$2
+    group=$3
+    public_key=$4
+    ssh_dir="$home/.ssh"
+    authorized_keys="$ssh_dir/authorized_keys"
+    mkdir -p "$ssh_dir"
+    chmod 0700 "$ssh_dir"
+    touch "$authorized_keys"
+    if ! grep -Fqx -- "$public_key" "$authorized_keys"; then
+      printf "%s\n" "$public_key" >>"$authorized_keys"
+    fi
+    chmod 0600 "$authorized_keys"
+    chown "$username:$group" "$ssh_dir" "$authorized_keys"
+  ' bash "$username" "$home" "$group" "$public_key"
+}
+
+create_user() {
+  local account
+  local gid
+  local group
+  local home
+  local public_key
+  local username
+
+  if ! has_controlling_terminal; then
+    log_step "No controlling terminal; skipping user setup"
+    return "$TASK_SKIPPED"
+  fi
+
+  while true; do
+    read_user_setup_input "Username (leave empty to skip): " || return "$TASK_SKIPPED"
+    username="$REPLY"
+    [ -n "$username" ] || return "$TASK_SKIPPED"
+    [[ "$username" =~ ^[a-z][a-z0-9_-]*$ ]] && break
+    echo "Invalid username. Use lowercase letters, digits, underscores, or hyphens." >&2
+  done
+
+  while true; do
+    read_user_setup_input "SSH public key (optional): " || return "$TASK_SKIPPED"
+    public_key="$REPLY"
+    [ -z "$public_key" ] && break
+    if [[ "$public_key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^[:space:]]+)[[:space:]]+[^[:space:]]+([[:space:]].*)?$ ]]; then
+      break
+    fi
+    echo "Invalid SSH public key. Enter a single-line OpenSSH public key." >&2
+  done
+
+  if ! getent passwd "$username" >/dev/null; then
+    run_as_root adduser --disabled-password --gecos "" "$username" || return
+  fi
+  account="$(getent passwd "$username")" || {
+    die "Unable to resolve account after creating user: $username"
+    return 1
+  }
+  IFS=: read -r _ _ _ gid _ home _ <<<"$account"
+  if [ -z "$home" ] || [[ "$home" != /* ]] || [ "$home" = / ]; then
+    die "Unsafe home directory for user $username: $home"
+    return 1
+  fi
+  group="$(getent group "$gid" | cut -d: -f1)" || {
+    die "Unable to resolve primary group for user: $username"
+    return 1
+  }
+  [ -n "$group" ] || {
+    die "Unable to resolve primary group for user: $username"
+    return 1
+  }
+
+  run_as_root usermod -aG sudo "$username" || return
+  if getent group docker >/dev/null; then
+    run_as_root usermod -aG docker "$username" || return
+  else
+    log_step "Docker group does not exist; skipping Docker membership"
+  fi
+  [ -z "$public_key" ] || configure_user_ssh_key "$username" "$home" "$group" "$public_key"
+}
+
 configure_vim() {
   write_root_file "/etc/vim/vimrc.local" <<EOL
 filetype plugin indent on
@@ -1034,6 +1125,7 @@ readonly MODULE_ORDER=(
   set_default_editor
   configure_docker
   install_docker
+  create_user
   configure_vim
   configure_passwordless_sudo
   configure_journald
@@ -1064,7 +1156,7 @@ category_modules() {
       ;;
     docker) printf '%s' "configure_docker install_docker" ;;
     system_configuration)
-      printf '%s' "configure_passwordless_sudo configure_journald configure_logrotate disable_apt_daily_timers disable_welcome_message"
+      printf '%s' "create_user configure_passwordless_sudo configure_journald configure_logrotate disable_apt_daily_timers disable_welcome_message"
       ;;
     *) die "Missing modules for category: $1" ;;
   esac
@@ -1081,6 +1173,7 @@ module_description() {
     set_default_editor) printf '%s' "Setting default editor" ;;
     configure_docker) printf '%s' "Configuring Docker" ;;
     install_docker) printf '%s' "Installing Docker" ;;
+    create_user) printf '%s' "Creating or configuring a user" ;;
     configure_vim) printf '%s' "Configuring Vim" ;;
     configure_passwordless_sudo) printf '%s' "Configuring passwordless sudo" ;;
     configure_journald) printf '%s' "Configuring journald" ;;
@@ -1098,6 +1191,10 @@ is_known_module() {
     [ "$module" = "$candidate" ] && return 0
   done
   return 1
+}
+
+is_default_module() {
+  [ "$1" != create_user ]
 }
 
 list_modules() {
@@ -1149,7 +1246,11 @@ select_modules_interactively() {
   trap 'cleanup_interactive_menu; cleanup_task_status; exit 130' INT TERM HUP
 
   for ((index = 0; index < ${#MODULE_ORDER[@]}; index++)); do
-    selected[index]=1
+    if is_default_module "${MODULE_ORDER[$index]}"; then
+      selected[index]=1
+    else
+      selected[index]=0
+    fi
   done
 
   printf '\033[?25l' >&3
@@ -1401,6 +1502,7 @@ is_selected_module() {
 }
 
 main() {
+  local all_requested=0
   local original_arg_count="$#"
   local run_all=1
   local selected_modules=""
@@ -1416,7 +1518,7 @@ main() {
         exit 0
         ;;
       all)
-        run_all=1
+        all_requested=1
         ;;
       -*)
         die "Unknown option: $1 (use --help for usage)"
@@ -1433,6 +1535,10 @@ main() {
     esac
     shift
   done
+
+  if [ "$original_arg_count" -gt 0 ]; then
+    run_all="$all_requested"
+  fi
 
   if [ "$original_arg_count" -eq 0 ] && has_controlling_terminal; then
     select_modules_interactively || {
@@ -1454,7 +1560,8 @@ main() {
 
   local module
   for module in "${MODULE_ORDER[@]}"; do
-    if [ "$run_all" -eq 1 ] || is_selected_module "$module" "$selected_modules"; then
+    if { [ "$run_all" -eq 1 ] && is_default_module "$module"; } ||
+      is_selected_module "$module" "$selected_modules"; then
       run_module "$module"
     fi
   done
