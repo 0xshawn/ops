@@ -986,6 +986,14 @@ configure_user_ssh_key() {
     public_key=$4
     ssh_dir="$home/.ssh"
     authorized_keys="$ssh_dir/authorized_keys"
+    if [ -L "$ssh_dir" ] || { [ -e "$ssh_dir" ] && [ ! -d "$ssh_dir" ]; }; then
+      echo "Unsafe SSH directory: $ssh_dir" >&2
+      exit 1
+    fi
+    if [ -L "$authorized_keys" ] || { [ -e "$authorized_keys" ] && [ ! -f "$authorized_keys" ]; }; then
+      echo "Unsafe authorized_keys path: $authorized_keys" >&2
+      exit 1
+    fi
     mkdir -p "$ssh_dir"
     chmod 0700 "$ssh_dir"
     touch "$authorized_keys"
@@ -997,12 +1005,32 @@ configure_user_ssh_key() {
   ' bash "$username" "$home" "$group" "$public_key"
 }
 
+validate_user_ssh_paths() {
+  local home="$1"
+
+  run_as_root bash -c '
+    set -euo pipefail
+    ssh_dir="$1/.ssh"
+    authorized_keys="$ssh_dir/authorized_keys"
+    if [ -L "$ssh_dir" ] || { [ -e "$ssh_dir" ] && [ ! -d "$ssh_dir" ]; }; then
+      echo "Unsafe SSH directory: $ssh_dir" >&2
+      exit 1
+    fi
+    if [ -L "$authorized_keys" ] || { [ -e "$authorized_keys" ] && [ ! -f "$authorized_keys" ]; }; then
+      echo "Unsafe authorized_keys path: $authorized_keys" >&2
+      exit 1
+    fi
+  ' bash "$home"
+}
+
 create_user() {
   local account
   local gid
   local group
   local home
   local public_key
+  local uid
+  local uid_min
   local username
 
   if ! has_controlling_terminal; then
@@ -1035,7 +1063,13 @@ create_user() {
     die "Unable to resolve account after creating user: $username"
     return 1
   }
-  IFS=: read -r _ _ _ gid _ home _ <<<"$account"
+  IFS=: read -r _ _ uid gid _ home _ <<<"$account"
+  uid_min="$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null)"
+  [[ "$uid_min" =~ ^[0-9]+$ ]] || uid_min=1000
+  if ! [[ "$uid" =~ ^[0-9]+$ ]] || [ "$uid" -eq 0 ] || [ "$uid" -lt "$uid_min" ]; then
+    die "Refusing to configure root or system account: $username"
+    return 1
+  fi
   if [ -z "$home" ] || [[ "$home" != /* ]] || [ "$home" = / ]; then
     die "Unsafe home directory for user $username: $home"
     return 1
@@ -1048,6 +1082,8 @@ create_user() {
     die "Unable to resolve primary group for user: $username"
     return 1
   }
+
+  [ -z "$public_key" ] || validate_user_ssh_paths "$home" || return
 
   run_as_root usermod -aG sudo "$username" || return
   if getent group docker >/dev/null; then
