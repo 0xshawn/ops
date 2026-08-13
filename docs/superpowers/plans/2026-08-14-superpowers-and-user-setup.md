@@ -137,3 +137,10 @@ Expected: no whitespace errors and every changed line maps to the spec.
 git add README.md
 git commit -m "docs: describe setup modules"
 ```
+
+## Execution Rulings
+
+- Treat `all create_user` and `create_user all` as the same union of default modules and the explicitly selected module.
+- Recognize the official checkout only when its normalized origin is `https://github.com/obra/superpowers` (optional `.git`).
+- Complete repository and link conflict checks before any clone, fetch, or directory creation.
+- Refuse SSH configuration when the resolved account home is empty, non-absolute, or `/`; resolve the primary group through the passwd GID.
